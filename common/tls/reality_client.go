@@ -49,6 +49,7 @@ type RealityClientConfig struct {
 	uClient   *UTLSClientConfig
 	publicKey []byte
 	shortID   [8]byte
+	keyShare  string // lx: SPEC 089 — C.RealityKeyShare*
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -84,7 +85,14 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
+	switch options.Reality.KeyShare {
+	case C.RealityKeyShareDefault, C.RealityKeyShareHybrid, C.RealityKeyShareClassical:
+	default:
+		return nil, E.New("unknown reality key_share: ", options.Reality.KeyShare, " (expected \"hybrid\" or \"classical\")")
+	}
+
+	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID, options.Reality.KeyShare}
+
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -132,6 +140,29 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
 }
 
 func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
+	uConn, verifier, err := e.prepareClientHello(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	err = uConn.HandshakeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if debug.Enabled {
+		fmt.Printf("REALITY Conn.Verified: %v\n", verifier.verified)
+	}
+
+	if !verifier.verified {
+		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+		return nil, E.New("reality verification failed")
+	}
+
+	return &realityClientConnWrapper{uConn}, nil
+}
+
+func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *realityVerifier, error) {
 	verifier := &realityVerifier{
 		serverName: e.uClient.ServerName(),
 	}
@@ -141,25 +172,34 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
 	uConn := utls.UClient(conn, uConfig, e.uClient.id)
 	verifier.UConn = uConn
+	
 	err := uConn.BuildHandshakeState()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
+
+	switch e.keyShare {
+	case C.RealityKeyShareClassical:
+		for _, extension := range uConn.Extensions {
+			if curves, isCurves := extension.(*utls.SupportedCurvesExtension); isCurves {
+				curves.Curves = common.Filter(curves.Curves, func(curveID utls.CurveID) bool {
+					return curveID != utls.X25519MLKEM768
+				})
+			}
+			if keyShares, isKeyShares := extension.(*utls.KeyShareExtension); isKeyShares {
+				keyShares.KeyShares = common.Filter(keyShares.KeyShares, func(share utls.KeyShare) bool {
+					return share.Group != utls.X25519MLKEM768
+				})
+			}
 		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
+		err = uConn.BuildHandshakeState()
+		if err != nil {
+			return nil, nil, err
 		}
-	}
-	err = uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, err
+	case C.RealityKeyShareHybrid:
+		if !realityHelloCarriesHybridShare(uConn) {
+			return nil, nil, E.New("reality key_share \"hybrid\": fingerprint ", e.uClient.id.Client, " ", e.uClient.id.Version, " carries no X25519MLKEM768 key share")
+		}
 	}
 
 	if len(uConfig.NextProtos) > 0 {
@@ -193,27 +233,27 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
 	if keyShareKeys == nil {
-		return nil, E.New("nil KeyShareKeys")
+		return nil, nil, E.New("nil KeyShareKeys")
 	}
 	ecdheKey := keyShareKeys.Ecdhe
 	if ecdheKey == nil {
-		return nil, E.New("nil ecdheKey")
+		return nil, nil, E.New("nil ecdheKey")
 	}
 	authKey, err := ecdheKey.ECDH(publicKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if authKey == nil {
-		return nil, E.New("nil auth_key")
+		return nil, nil, E.New("nil auth_key")
 	}
 	verifier.authKey = authKey
 	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	aesBlock, _ := aes.NewCipher(authKey)
 	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
@@ -224,21 +264,20 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		fmt.Printf("REALITY uConn.AuthKey: %v\n", authKey)
 	}
 
-	err = uConn.HandshakeContext(ctx)
-	if err != nil {
-		return nil, err
-	}
+	return uConn, verifier, nil
+}
 
-	if debug.Enabled {
-		fmt.Printf("REALITY Conn.Verified: %v\n", verifier.verified)
+func realityHelloCarriesHybridShare(uConn *utls.UConn) bool {
+	for _, extension := range uConn.Extensions {
+		if keyShares, isKeyShares := extension.(*utls.KeyShareExtension); isKeyShares {
+			for _, share := range keyShares.KeyShares {
+				if share.Group == utls.X25519MLKEM768 {
+					return true
+				}
+			}
+		}
 	}
-
-	if !verifier.verified {
-		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
-		return nil, E.New("reality verification failed")
-	}
-
-	return &realityClientConnWrapper{uConn}, nil
+	return false
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
@@ -271,6 +310,7 @@ func (e *RealityClientConfig) Clone() Config {
 		e.uClient.Clone().(*UTLSClientConfig),
 		e.publicKey,
 		e.shortID,
+		e.keyShare,
 	}
 }
 

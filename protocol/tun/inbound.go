@@ -64,6 +64,9 @@ type Inbound struct {
 	routeAddressSetAccess   sync.RWMutex
 	routeAddressSet         []*netipx.IPSet
 	routeExcludeAddressSet  []*netipx.IPSet
+// 👇 补上这两行
+	sniff                    bool
+	sniffOverrideDestination bool
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -244,6 +247,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Logger:                                logger,
 			EXP_MultiPendingPackets:               C.IsDarwin,
 		},
+	   // 👇 补上这两行赋值 (如果 Options 里报错，可以直接写 options.Sniff)
+		sniff:                    options.Sniff,
+		sniffOverrideDestination: options.SniffOverrideDestination,		
+		
 		udpTimeout:        udpTimeout,
 		udpMapping:        tun.NATMapping(options.UDPMapping),
 		udpFiltering:      tun.NATFiltering(options.UDPFiltering),
@@ -627,6 +634,9 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
+	metadata.SniffEnabled = t.sniff
+	metadata.SniffOverrideDestination = t.sniffOverrideDestination
+
 	if t.isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}
@@ -646,6 +656,9 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
+// 👇 补上这两行标志传递
+	metadata.SniffEnabled = t.sniff
+	metadata.SniffOverrideDestination = t.sniffOverrideDestination
 	if t.isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}
@@ -671,6 +684,8 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
+	metadata.SniffEnabled = (*Inbound)(t).sniff
+	metadata.SniffOverrideDestination = (*Inbound)(t).sniffOverrideDestination
 	if (*Inbound)(t).isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}

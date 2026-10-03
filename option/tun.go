@@ -52,6 +52,9 @@ type TunInboundOptions struct {
 	UDPNATMax                     uint32                           `json:"udp_nat_max,omitempty"`
 	MultiQueue                    bool                             `json:"multi_queue,omitempty"`
 	Platform                      *TunPlatformOptions              `json:"platform,omitempty"`
+	// 新增：让 config.json 能够识别 TUN 中的 sniff 字段
+	Sniff                    bool `json:"sniff,omitempty"`
+	SniffOverrideDestination bool `json:"sniff_override_destination,omitempty"`
 	InboundOptions
 
 	Stack string `json:"stack,omitempty" schema:"omit"`

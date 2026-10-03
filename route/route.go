@@ -69,6 +69,29 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 }
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+// ==================== [非阻塞安全型 TCP Sniff] ====================
+	if metadata.SniffEnabled {
+		sniffCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		sniffBuffer := buf.NewPacket()
+
+		err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
+			sniff.TLSClientHello, sniff.HTTPHost, sniff.StreamDomainNameQuery)
+		cancel()
+
+		if err == nil && M.IsDomainName(metadata.Domain) {
+			// 仅打印日志，不强行覆盖 metadata.Destination！
+			// metadata.Domain 已经被 PeekStream 自动填入，可直接用于 domain 规则匹配
+			r.logger.DebugContext(ctx, "嗅探到域名(不覆盖目标): ", metadata.Domain)
+		}
+
+		if !sniffBuffer.IsEmpty() {
+			conn = bufio.NewCachedConn(conn, sniffBuffer)
+		} else {
+			sniffBuffer.Release()
+		}
+	}
+	// ========================================================================
+
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -245,6 +268,28 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+// ==================== [非阻塞安全型 UDP Sniff] ====================
+	if metadata.SniffEnabled {
+		sniffBuffer := buf.NewPacket()
+
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		destination, err := conn.ReadPacket(sniffBuffer)
+		_ = conn.SetReadDeadline(time.Time{})
+
+		if err == nil && !sniffBuffer.IsEmpty() {
+			sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
+			if sniffErr == nil && M.IsDomainName(metadata.Domain) {
+				// 仅打印日志，不强行覆盖 metadata.Destination！
+				r.logger.DebugContext(ctx, "嗅探到 UDP 域名(不覆盖目标): ", metadata.Domain)
+			}
+			conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
+		} else {
+			sniffBuffer.Release()
+		}
+	}
+	// =========================================================================
+
+
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {

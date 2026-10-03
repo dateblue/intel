@@ -61,6 +61,10 @@ type InboundContext struct {
 
 	// sniffer
 
+	// [已恢复] 嗅探开关标志字段，解决 inbound 中的编译报错
+	SniffEnabled             bool
+	SniffOverrideDestination bool
+
 	Protocol     string
 	Domain       string
 	Client       string

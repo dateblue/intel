@@ -47,12 +47,17 @@ func (h *Inbound) UnmarshalJSONContext(ctx context.Context, content []byte) erro
 	if err != nil {
 		return err
 	}
+	
+	// 已修改：允许读取旧版的 InboundOptions 字段，不再直接抛出致命错误
+	/*
 	if listenWrapper, isListen := options.(ListenOptionsWrapper); isListen {
 		//nolint:staticcheck
 		if listenWrapper.TakeListenOptions().InboundOptions != (InboundOptions{}) {
 			return E.New("legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-legacy-inbound-fields-to-rule-actions")
 		}
 	}
+	*/
+
 	h.Options = options
 	return nil
 }
@@ -67,13 +72,13 @@ func (h Inbound) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
 	})
 }
 
-// Deprecated: Use rule action instead
+// 恢复 InboundOptions 字段解析支持
 type InboundOptions struct {
-	SniffEnabled              bool               `json:"sniff,omitempty" schema:"omit"`
-	SniffOverrideDestination  bool               `json:"sniff_override_destination,omitempty" schema:"omit"`
-	SniffTimeout              badoption.Duration `json:"sniff_timeout,omitempty" schema:"omit"`
-	DomainStrategy            DomainStrategy     `json:"domain_strategy,omitempty" schema:"omit"`
-	UDPDisableDomainUnmapping bool               `json:"udp_disable_domain_unmapping,omitempty" schema:"omit"`
+	SniffEnabled              bool               `json:"sniff,omitempty"`
+	SniffOverrideDestination  bool               `json:"sniff_override_destination,omitempty"`
+	SniffTimeout              badoption.Duration `json:"sniff_timeout,omitempty"`
+	DomainStrategy            DomainStrategy     `json:"domain_strategy,omitempty"`
+	UDPDisableDomainUnmapping bool               `json:"udp_disable_domain_unmapping,omitempty"`
 }
 
 type ListenOptions struct {
@@ -99,7 +104,7 @@ type ListenOptions struct {
 	ProxyProtocolAcceptNoHeader bool `json:"proxy_protocol_accept_no_header,omitempty" schema:"omit"`
 	// Legacy inbound fields are rejected since sing-box 1.13.0.
 	//nolint:staticcheck
-	InboundOptions `schema:"omit"`
+	InboundOptions
 }
 
 type UDPNATBehavior uint8
