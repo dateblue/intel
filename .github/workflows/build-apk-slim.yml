@@ -1,0 +1,103 @@
+name: Build Custom SFA APK slim
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-apk-slim.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取 Android 客户端外壳 (SFA)
+      - name: Checkout sing-box-for-android
+        uses: actions/checkout@v4
+        with:
+          repository: 'SagerNet/sing-box-for-android'
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # 2. 将官方 sing-box 核心替换为你自定义的 dateblue/intel 代码
+      - name: Replace core with custom dateblue/intel
+        run: |
+          rm -rf sing-box
+          git clone --depth 1 https://github.com/dateblue/intel.git sing-box
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Setup Android SDK & NDK
+        id: setup-android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      # 3. 精简 libbox 构建标签：去掉 wireguard / naive / usbip / openvpn / openconnect / tailscale
+      #    保留 quic / utls / clash_api (VLESS+Reality、Hysteria2、TUIC v5 所需)
+      - name: Slim libbox build tags
+        run: |
+          F=sing-box/cmd/internal/build_libbox/main.go
+          sed -i 's/"with_wireguard", //; s/"with_naive_outbound", //; s/"with_usbip", //; s/"with_openvpn", //; s/"with_openconnect", //' "$F"
+          sed -i '/sharedTags = append(sharedTags, "with_tailscale"/d' "$F"
+          echo "---- sharedTags lines after patch ----"
+          grep -n 'sharedTags = append' "$F"
+          if grep 'sharedTags = append' "$F" | grep -qE 'with_(wireguard|naive_outbound|usbip|openvpn|openconnect|tailscale)'; then
+            echo "slimming failed: heavy tags still present"; exit 1
+          fi
+      # 4. 编译核心 (仅 arm64)；-s -w 已由 build_libbox 的 LinkerFlags 传入
+      - name: Build Libbox Core (arm64 minimal build)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-android.outputs.sdk-path }}/ndk/25.2.9519653
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cd sing-box
+          go run ./cmd/internal/build_libbox -target android -platform android/arm64
+          mkdir -p ../app/libs
+          cp libbox.aar ../app/libs/libbox.aar
+      # 5. 检查 libbox.so 体积与残留模块 (仅提示，不使构建失败)
+      #    判据以体积为准；对比之前未精简的 69,422,568 字节
+      - name: Inspect libbox
+        run: |
+          rm -rf /tmp/aar && mkdir -p /tmp/aar
+          unzip -o app/libs/libbox.aar 'jni/arm64-v8a/libbox.so' -d /tmp/aar
+          ls -l /tmp/aar/jni/arm64-v8a/libbox.so
+          for k in 'tailscale.com/' 'golang.zx2c4.com/wireguard' 'cronet-go'; do
+            echo "$k : $(grep -a -c -i "$k" /tmp/aar/jni/arm64-v8a/libbox.so || true)"
+          done
+      # 6. 生成 Release 密钥并打包 (每次构建签名不同，覆盖安装需先卸载旧版)
+      - name: Generate Key & Build Release APK
+        run: |
+          rm -f app/release.keystore
+          keytool -genkeypair -v \
+            -keystore app/release.keystore \
+            -alias androidreleasekey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android,OU=Android,O=Android,L=Unknown,ST=Unknown,C=US"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleOtherRelease \
+            -Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androidreleasekey \
+            -Pandroid.injected.signing.key.password=android \
+            --stacktrace
+      # 7. 上传 arm64-v8a 安装包
+      - name: Upload APK Product
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-arm64-v8a-release-apk
+          path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
