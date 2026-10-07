@@ -67,6 +67,7 @@ type Inbound struct {
 // 👇 补上这两行
 	sniff                    bool
 	sniffOverrideDestination bool
+
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -659,6 +660,7 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 // 👇 补上这两行标志传递
 	metadata.SniffEnabled = t.sniff
 	metadata.SniffOverrideDestination = t.sniffOverrideDestination
+
 	if t.isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}
