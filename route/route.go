@@ -68,25 +68,33 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 	}
 }
 
+// ========sniff override功能辅助函数
+func (r *Router) isFakeIPAddr(addr netip.Addr) bool {
+	fakeIP := r.dnsTransport.FakeIP()
+	return addr.IsValid() && fakeIP != nil && fakeIP.Store().Contains(addr)
+}
+
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 TCP Sniff] ====================
-	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() {
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !sniff.Skip(&metadata) && !r.isFakeIPAddr(metadata.Destination.Addr) {
 		sniffCtx, cancel := context.WithTimeout(ctx, C.ReadPayloadTimeout)
 		sniffBuffer := buf.NewPacket()
-
 		err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
 			sniff.TLSClientHello, sniff.HTTPHost, sniff.StreamDomainNameQuery)
 		cancel()
-
-		if err == nil && M.IsDomainName(metadata.Domain) {
-			r.logger.DebugContext(ctx, "sniffed domain: ", metadata.Domain)
-			// 恢复 override
-			metadata.Destination = M.Socksaddr{
-				Fqdn: metadata.Domain,
-				Port: metadata.Destination.Port,
+		if err == nil {
+			if metadata.Domain != "" {
+				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
+			} else {
+				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol)
+			}
+			if metadata.SniffOverrideDestination && M.IsDomainName(metadata.Domain) {
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
 			}
 		}
-
 		if !sniffBuffer.IsEmpty() {
 			conn = bufio.NewCachedConn(conn, sniffBuffer)
 		} else {
@@ -272,45 +280,28 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 UDP Sniff] ====================
-	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() {
-		const maxSniffPackets = 4 // QUIC Initial 可能跨多个包
-
-		type cached struct {
-			buffer      *buf.Buffer
-			destination M.Socksaddr
-		}
-		var cachedPackets []cached
-		deadline := time.Now().Add(C.ReadPayloadTimeout)
-
-		for i := 0; i < maxSniffPackets; i++ {
-			_ = conn.SetReadDeadline(deadline)
-			buffer := buf.NewPacket()
-			destination, err := conn.ReadPacket(buffer)
-			if err != nil {
-				buffer.Release()
-				break
-			}
-			cachedPackets = append(cachedPackets, cached{buffer, destination})
-
-			sniffErr := sniff.PeekPacket(ctx, &metadata, buffer.Bytes(), defaultPacketSniffers...)
-			if sniffErr == nil && M.IsDomainName(metadata.Domain) {
-				r.logger.DebugContext(ctx, "sniffed UDP domain: ", metadata.Domain)
-				metadata.Destination = M.Socksaddr{
-					Fqdn: metadata.Domain,
-					Port: metadata.Destination.Port,
-				}
-				break
-			}
-		}
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !sniff.Skip(&metadata) && !r.isFakeIPAddr(metadata.Destination.Addr) {
+		sniffBuffer := buf.NewPacket()
+		_ = conn.SetReadDeadline(time.Now().Add(C.ReadPayloadTimeout))
+		destination, err := conn.ReadPacket(sniffBuffer)
 		_ = conn.SetReadDeadline(time.Time{})
-
-		// 逆序包装，保证回放顺序和原始到达顺序一致
-		for i := len(cachedPackets) - 1; i >= 0; i-- {
-			conn = bufio.NewCachedPacketConn(conn, cachedPackets[i].buffer, cachedPackets[i].destination)
+		if err == nil && !sniffBuffer.IsEmpty() {
+			sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
+			if sniffErr == nil {
+				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
+				if metadata.SniffOverrideDestination && M.IsDomainName(metadata.Domain) {
+					metadata.Destination = M.Socksaddr{
+						Fqdn: metadata.Domain,
+						Port: metadata.Destination.Port,
+					}
+				}
+			}
+			conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
+		} else {
+			sniffBuffer.Release()
 		}
 	}
 	// ...
-
 
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
