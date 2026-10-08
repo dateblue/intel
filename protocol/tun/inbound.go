@@ -637,7 +637,7 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	metadata.SniffEnabled = t.sniff
 	metadata.SniffOverrideDestination = t.sniffOverrideDestination
-
+	
 	if t.isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}
@@ -688,6 +688,7 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	metadata.Destination = destination
 	metadata.SniffEnabled = (*Inbound)(t).sniff
 	metadata.SniffOverrideDestination = (*Inbound)(t).sniffOverrideDestination
+
 	if (*Inbound)(t).isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}

@@ -67,13 +67,14 @@ func (w *systemDevice) Inet6Address() netip.Addr {
 }
 
 func (w *systemDevice) SetDevice(device *device.Device, peers []*device.Peer) {
-func (w *systemDevice) UpstreamPort() any {
-    ports := w.ports.Load()
-    if ports == nil {
-        return nil
-    }
-    return ports
 }
+
+func (w *systemDevice) UpstreamPort() any {
+	ports := w.ports.Load()
+	if ports == nil {
+		return nil
+	}
+	return ports
 }
 
 func (w *systemDevice) Start() error {

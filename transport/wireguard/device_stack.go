@@ -108,8 +108,10 @@ func (w *stackDevice) Inet6Address() netip.Addr {
 }
 
 func (w *stackDevice) UpstreamPort() any {
-    return w.stack
+	return w.stack
 }
+
+>>>>>>> upstream/testing
 func (w *stackDevice) SetDevice(device *device.Device, peers []*device.Peer) {
 	w.router.setPeers(device.AllowedIPs(), peers)
 }
