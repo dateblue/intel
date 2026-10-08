@@ -69,9 +69,10 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 }
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-// ==================== [非阻塞安全型 TCP Sniff] ====================
+	// ==================== [优化版 TCP Sniff] ====================
 	if metadata.SniffEnabled {
-		sniffCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		// 缩短超时时间至 30ms，避免卡顿
+		sniffCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 		sniffBuffer := buf.NewPacket()
 
 		err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
@@ -79,9 +80,9 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		cancel()
 
 		if err == nil && M.IsDomainName(metadata.Domain) {
-			// 仅打印日志，不强行覆盖 metadata.Destination！
-			// metadata.Domain 已经被 PeekStream 自动填入，可直接用于 domain 规则匹配
-			r.logger.DebugContext(ctx, "嗅探到域名(不覆盖目标): ", metadata.Domain)
+			r.logger.DebugContext(ctx, "嗅探到域名: ", metadata.Domain)
+			// 如果需要奈飞精准分流，取消注释下面这行以覆盖 Destination
+			// metadata.Destination = M.ParseSocksaddrHostPort(metadata.Domain, metadata.Destination.Port)
 		}
 
 		if !sniffBuffer.IsEmpty() {
@@ -90,7 +91,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			sniffBuffer.Release()
 		}
 	}
-	// ========================================================================
+	// ...
 
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
@@ -268,26 +269,26 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-// ==================== [非阻塞安全型 UDP Sniff] ====================
+	// ==================== [优化版 UDP Sniff] ====================
 	if metadata.SniffEnabled {
 		sniffBuffer := buf.NewPacket()
 
-		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		// UDP 死等超时时间缩短至 15ms，减少 QUIC 建立延迟
+		_ = conn.SetReadDeadline(time.Now().Add(15 * time.Millisecond))
 		destination, err := conn.ReadPacket(sniffBuffer)
 		_ = conn.SetReadDeadline(time.Time{})
 
 		if err == nil && !sniffBuffer.IsEmpty() {
 			sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
 			if sniffErr == nil && M.IsDomainName(metadata.Domain) {
-				// 仅打印日志，不强行覆盖 metadata.Destination！
-				r.logger.DebugContext(ctx, "嗅探到 UDP 域名(不覆盖目标): ", metadata.Domain)
+				r.logger.DebugContext(ctx, "嗅探到 UDP 域名: ", metadata.Domain)
 			}
 			conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
 		} else {
 			sniffBuffer.Release()
 		}
 	}
-	// =========================================================================
+	// ...
 
 
 	//nolint:staticcheck
