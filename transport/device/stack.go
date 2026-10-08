@@ -150,7 +150,6 @@ func (d *stackDevice) UpstreamPort() any {
 	return d.stack
 }
 
->>>>>>> upstream/testing
 func (d *stackDevice) NewOutboundQueue(handler func(packetBuffers []*buf.Buffer)) *tun.OutboundQueue {
 	return d.memoryTun.NewOutboundQueue(handler)
 }
