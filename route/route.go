@@ -70,9 +70,8 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 TCP Sniff] ====================
-	if metadata.SniffEnabled {
-		// 缩短超时时间至 30ms，避免卡顿
-		sniffCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() {
+		sniffCtx, cancel := context.WithTimeout(ctx, C.ReadPayloadTimeout)
 		sniffBuffer := buf.NewPacket()
 
 		err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
@@ -80,9 +79,12 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		cancel()
 
 		if err == nil && M.IsDomainName(metadata.Domain) {
-			r.logger.DebugContext(ctx, "嗅探到域名: ", metadata.Domain)
-			// 如果需要奈飞精准分流，取消注释下面这行以覆盖 Destination
-			// metadata.Destination = M.ParseSocksaddrHostPort(metadata.Domain, metadata.Destination.Port)
+			r.logger.DebugContext(ctx, "sniffed domain: ", metadata.Domain)
+			// 恢复 override
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.Domain,
+				Port: metadata.Destination.Port,
+			}
 		}
 
 		if !sniffBuffer.IsEmpty() {
@@ -270,22 +272,41 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 UDP Sniff] ====================
-	if metadata.SniffEnabled {
-		sniffBuffer := buf.NewPacket()
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() {
+		const maxSniffPackets = 4 // QUIC Initial 可能跨多个包
 
-		// UDP 死等超时时间缩短至 15ms，减少 QUIC 建立延迟
-		_ = conn.SetReadDeadline(time.Now().Add(15 * time.Millisecond))
-		destination, err := conn.ReadPacket(sniffBuffer)
+		type cached struct {
+			buffer      *buf.Buffer
+			destination M.Socksaddr
+		}
+		var cachedPackets []cached
+		deadline := time.Now().Add(C.ReadPayloadTimeout)
+
+		for i := 0; i < maxSniffPackets; i++ {
+			_ = conn.SetReadDeadline(deadline)
+			buffer := buf.NewPacket()
+			destination, err := conn.ReadPacket(buffer)
+			if err != nil {
+				buffer.Release()
+				break
+			}
+			cachedPackets = append(cachedPackets, cached{buffer, destination})
+
+			sniffErr := sniff.PeekPacket(ctx, &metadata, buffer.Bytes(), defaultPacketSniffers...)
+			if sniffErr == nil && M.IsDomainName(metadata.Domain) {
+				r.logger.DebugContext(ctx, "sniffed UDP domain: ", metadata.Domain)
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
+				break
+			}
+		}
 		_ = conn.SetReadDeadline(time.Time{})
 
-		if err == nil && !sniffBuffer.IsEmpty() {
-			sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
-			if sniffErr == nil && M.IsDomainName(metadata.Domain) {
-				r.logger.DebugContext(ctx, "嗅探到 UDP 域名: ", metadata.Domain)
-			}
-			conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
-		} else {
-			sniffBuffer.Release()
+		// 逆序包装，保证回放顺序和原始到达顺序一致
+		for i := len(cachedPackets) - 1; i >= 0; i-- {
+			conn = bufio.NewCachedPacketConn(conn, cachedPackets[i].buffer, cachedPackets[i].destination)
 		}
 	}
 	// ...
