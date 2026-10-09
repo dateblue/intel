@@ -76,29 +76,36 @@ func (r *Router) isFakeIPAddr(addr netip.Addr) bool {
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 TCP Sniff] ====================
-	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !sniff.Skip(&metadata) && !r.isFakeIPAddr(metadata.Destination.Addr) {
-		sniffCtx, cancel := context.WithTimeout(ctx, C.ReadPayloadTimeout)
-		sniffBuffer := buf.NewPacket()
-		err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
-			sniff.TLSClientHello, sniff.HTTPHost, sniff.StreamDomainNameQuery)
-		cancel()
-		if err == nil {
-			if metadata.Domain != "" {
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !r.isFakeIPAddr(metadata.Destination.Addr) {
+		if !sniff.Skip(&metadata) {
+			sniffCtx, cancel := context.WithTimeout(ctx, time.Second)
+			sniffBuffer := buf.NewPacket()
+			err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
+				sniff.TLSClientHello, sniff.HTTPHost, sniff.StreamDomainNameQuery)
+			cancel()
+			if err == nil {
 				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
 			} else {
-				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol)
+				r.logger.DebugContext(ctx, "sniff failed: ", err)
 			}
-			if metadata.SniffOverrideDestination && M.IsDomainName(metadata.Domain) {
-				metadata.Destination = M.Socksaddr{
-					Fqdn: metadata.Domain,
-					Port: metadata.Destination.Port,
-				}
+			if !sniffBuffer.IsEmpty() {
+				conn = bufio.NewCachedConn(conn, sniffBuffer)
+			} else {
+				sniffBuffer.Release()
 			}
 		}
-		if !sniffBuffer.IsEmpty() {
-			conn = bufio.NewCachedConn(conn, sniffBuffer)
-		} else {
-			sniffBuffer.Release()
+		// 兜底：嗅探没拿到域名时，用 DNS 反向映射
+		if metadata.Domain == "" {
+			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded {
+				metadata.Domain = domain
+				r.logger.DebugContext(ctx, "override by reverse mapping: ", domain)
+			}
+		}
+		if M.IsDomainName(metadata.Domain) {
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.Domain,
+				Port: metadata.Destination.Port,
+			}
 		}
 	}
 	// ...
@@ -280,25 +287,32 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	// ==================== [优化版 UDP Sniff] ====================
-	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !sniff.Skip(&metadata) && !r.isFakeIPAddr(metadata.Destination.Addr) {
-		sniffBuffer := buf.NewPacket()
-		_ = conn.SetReadDeadline(time.Now().Add(C.ReadPayloadTimeout))
-		destination, err := conn.ReadPacket(sniffBuffer)
-		_ = conn.SetReadDeadline(time.Time{})
-		if err == nil && !sniffBuffer.IsEmpty() {
-			sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
-			if sniffErr == nil {
-				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
-				if metadata.SniffOverrideDestination && M.IsDomainName(metadata.Domain) {
-					metadata.Destination = M.Socksaddr{
-						Fqdn: metadata.Domain,
-						Port: metadata.Destination.Port,
-					}
+	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !r.isFakeIPAddr(metadata.Destination.Addr) {
+		if !sniff.Skip(&metadata) {
+			sniffBuffer := buf.NewPacket()
+			_ = conn.SetReadDeadline(time.Now().Add(C.ReadPayloadTimeout))
+			destination, err := conn.ReadPacket(sniffBuffer)
+			_ = conn.SetReadDeadline(time.Time{})
+			if err == nil && !sniffBuffer.IsEmpty() {
+				sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
+				if sniffErr == nil {
+					r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
 				}
+				conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
+			} else {
+				sniffBuffer.Release()
 			}
-			conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
-		} else {
-			sniffBuffer.Release()
+		}
+		if metadata.Domain == "" {
+			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded {
+				metadata.Domain = domain
+			}
+		}
+		if M.IsDomainName(metadata.Domain) {
+			metadata.Destination = M.Socksaddr{
+				Fqdn: metadata.Domain,
+				Port: metadata.Destination.Port,
+			}
 		}
 	}
 	// ...
