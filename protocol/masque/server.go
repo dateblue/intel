@@ -231,7 +231,6 @@ func (s *ServerEndpoint) PortMTU() uint32 {
 }
 
 func (s *ServerEndpoint) UpstreamPort() any {
-
 	return s.device
 }
 

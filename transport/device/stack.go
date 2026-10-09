@@ -146,7 +146,6 @@ func (d *stackDevice) PortMTU() uint32 {
 }
 
 func (d *stackDevice) UpstreamPort() any {
-
 	return d.stack
 }
 
