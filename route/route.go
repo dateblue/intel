@@ -75,9 +75,11 @@ func (r *Router) isFakeIPAddr(addr netip.Addr) bool {
 }
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	// ==================== [优化版 TCP Sniff] ====================
+	// ==================== [TCP Sniff & Override] ====================
 	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !r.isFakeIPAddr(metadata.Destination.Addr) {
+		// [KEEP] 服务端先发数据的端口（SSH/SMTP 等）跳过嗅探，避免白等
 		if !sniff.Skip(&metadata) {
+			// [KEEP] 超时用 1 秒：读到完整 ClientHello 就立即返回，只对慢设备（Chromecast）有利
 			sniffCtx, cancel := context.WithTimeout(ctx, time.Second)
 			sniffBuffer := buf.NewPacket()
 			err := sniff.PeekStream(sniffCtx, &metadata, conn, nil, sniffBuffer, 0,
@@ -89,6 +91,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 				r.logger.DebugContext(ctx, "sniff failed: ", err)
 			}
 			if !sniffBuffer.IsEmpty() {
+				// [KEEP] 用 bufio.NewCachedConn，已编译通过并实测可用（不要换 buf.NewEarlyConn）
 				conn = bufio.NewCachedConn(conn, sniffBuffer)
 			} else {
 				sniffBuffer.Release()
@@ -96,11 +99,13 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		}
 		// 兜底：嗅探没拿到域名时，用 DNS 反向映射
 		if metadata.Domain == "" {
-			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded {
+			// [CHANGED] 增加 M.IsDomainName(domain) 校验，反查结果合法才采用
+			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded && M.IsDomainName(domain) {
 				metadata.Domain = domain
 				r.logger.DebugContext(ctx, "override by reverse mapping: ", domain)
 			}
 		}
+		// [KEEP] 无条件覆盖，不依赖 sniff_override_destination 配置开关
 		if M.IsDomainName(metadata.Domain) {
 			metadata.Destination = M.Socksaddr{
 				Fqdn: metadata.Domain,
@@ -286,26 +291,29 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	// ==================== [优化版 UDP Sniff] ====================
+	// ==================== [UDP Sniff & Override] ====================
 	if metadata.SniffEnabled && !metadata.Destination.IsFqdn() && !r.isFakeIPAddr(metadata.Destination.Addr) {
 		if !sniff.Skip(&metadata) {
 			sniffBuffer := buf.NewPacket()
 			_ = conn.SetReadDeadline(time.Now().Add(C.ReadPayloadTimeout))
 			destination, err := conn.ReadPacket(sniffBuffer)
-			_ = conn.SetReadDeadline(time.Time{})
+			_ = conn.SetReadDeadline(time.Time{}) // [KEEP] 读完必须清掉 deadline
 			if err == nil && !sniffBuffer.IsEmpty() {
 				sniffErr := sniff.PeekPacket(ctx, &metadata, sniffBuffer.Bytes(), defaultPacketSniffers...)
 				if sniffErr == nil {
 					r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain)
 				}
+				// [KEEP] 只要读出了包，不管嗅探成败都回放，不丢包
 				conn = bufio.NewCachedPacketConn(conn, sniffBuffer, destination)
 			} else {
 				sniffBuffer.Release()
 			}
 		}
 		if metadata.Domain == "" {
-			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded {
+			// [CHANGED] 同 TCP：增加 M.IsDomainName(domain) 校验
+			if domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr); loaded && M.IsDomainName(domain) {
 				metadata.Domain = domain
+				r.logger.DebugContext(ctx, "override by reverse mapping (udp): ", domain)
 			}
 		}
 		if M.IsDomainName(metadata.Domain) {
