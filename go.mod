@@ -35,7 +35,7 @@ require (
 	github.com/sagernet/asc-go v0.0.0-20260914163356-9e3d45a797c1
 	github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832
 	github.com/sagernet/cors v1.2.1
-	github.com/sagernet/cronet-go v0.0.1-143.0.7499.109-1
+	github.com/sagernet/cronet-go v0.0.0-20260929213745-4d18a60dc3a8
 	github.com/sagernet/cronet-go/all v0.0.0-20260929213745-4d18a60dc3a8
 	github.com/sagernet/fswatch v0.1.2
 	github.com/sagernet/gliderssh v0.3.4-0.20260531100337-2194faca5648
