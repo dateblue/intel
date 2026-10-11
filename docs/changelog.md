@@ -14,6 +14,10 @@ On Wayland compositors that support the layer shell protocol, such as niri and K
 Linux client is now shown as a layer shell surface instead of a regular window, so it is placed next to the tray
 icon and is no longer decorated or tiled by the compositor.
 
+#### 1.15.0-alpha.12
+
+* Fixes and improvements
+
 #### 1.15.0-alpha.11
 
 * Fixes and improvements
