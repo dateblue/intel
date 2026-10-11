@@ -1,0 +1,311 @@
+name: Build Custom sing-box (naive)
+
+# 放到仓库的 .github/workflows/build-naive.yml
+# 产物:
+#   1. sing-box-arm64-v8a-naive-release-apk   Android arm64 APK (带 naive)
+#   2. sing-box-windows-amd64                 sing-box.exe + libcronet.dll (purego)
+#   3. sing-box-linux-amd64-musl              CGO + musl, 适合 OpenWrt/ImmortalWrt x86
+#   4. sing-box-linux-arm64                   CGO + glibc
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-naive.yml'
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'dateblue/intel 的分支或 tag (留空 = 默认分支)'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: '写入二进制的版本号'
+        required: false
+        default: '1.15.0-custom-naive'
+        type: string
+
+env:
+  CORE_REPO: https://github.com/dateblue/intel.git
+  CORE_REF: ${{ inputs.core_ref }}
+  VERSION: ${{ inputs.version || '1.15.0-custom-naive' }}
+  # 二进制版本的 tag: 精简集 + naive; badlinkname/tfogo_checklinkname0 与上游 release 保持一致
+  BASE_TAGS: with_quic,with_utls,with_dhcp,with_clash_api,with_naive,with_naive_outbound,badlinkname,tfogo_checklinkname0
+
+jobs:
+  # ------------------------------------------------------------------
+  # A. Android APK (arm64, 保留 naive)
+  # ------------------------------------------------------------------
+  apk:
+    name: Android APK (arm64, naive)
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取 Android 客户端外壳 (SFA)
+      - name: Checkout sing-box-for-android
+        uses: actions/checkout@v4
+        with:
+          repository: 'SagerNet/sing-box-for-android'
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # 2. 将官方 sing-box 核心替换为自定义的 dateblue/intel 代码
+      - name: Replace core with custom dateblue/intel
+        run: |
+          rm -rf sing-box
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" sing-box
+          else
+            git clone --depth 1 "$CORE_REPO" sing-box
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      # Gradle 打包仍使用原来的 NDK 25
+      - name: Setup Android SDK & NDK 25
+        id: setup-android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      # naive (cronet) 的 cgo 链接用 NDK r28, 与上游 release 一致
+      - name: Setup Android NDK r28 (for libbox)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      # 3. 精简 libbox 构建标签：去掉 wireguard / usbip / openvpn / openconnect / tailscale
+      #    保留 quic / utls / clash_api / naive_outbound
+      - name: Slim libbox build tags (keep naive)
+        run: |
+          F=sing-box/cmd/internal/build_libbox/main.go
+          sed -i 's/"with_wireguard", //; s/"with_usbip", //; s/"with_openvpn", //; s/"with_openconnect", //' "$F"
+          sed -i '/sharedTags = append(sharedTags, "with_tailscale"/d' "$F"
+          echo "---- sharedTags lines after patch ----"
+          grep -n 'sharedTags = append' "$F"
+          if grep 'sharedTags = append' "$F" | grep -qE 'with_(wireguard|usbip|openvpn|openconnect|tailscale)'; then
+            echo "slimming failed: heavy tags still present"; exit 1
+          fi
+          if ! grep 'sharedTags = append' "$F" | grep -q 'with_naive_outbound'; then
+            echo "with_naive_outbound missing from sharedTags"; exit 1
+          fi
+
+      # 4. 编译核心 (仅 arm64)
+      #    build_libbox 会同时产出 libbox.aar (API 24, 含 naive) 和 libbox-legacy.aar (API 21, 无 naive)
+      #    "other" 变体使用 libbox.aar
+      - name: Build Libbox Core (arm64, naive)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cd sing-box
+          go run ./cmd/internal/build_libbox -target android -platform android/arm64
+          mkdir -p ../app/libs
+          cp libbox.aar ../app/libs/libbox.aar
+
+      # 5. 检查 libbox.so 体积; cronet-go 应当存在 (说明 naive 已编入)
+      - name: Inspect libbox
+        run: |
+          rm -rf /tmp/aar && mkdir -p /tmp/aar
+          unzip -o app/libs/libbox.aar 'jni/arm64-v8a/libbox.so' -d /tmp/aar
+          ls -l /tmp/aar/jni/arm64-v8a/libbox.so
+          for k in 'tailscale.com/' 'golang.zx2c4.com/wireguard' 'cronet-go'; do
+            echo "$k : $(grep -a -c -i "$k" /tmp/aar/jni/arm64-v8a/libbox.so || true)"
+          done
+
+      # 6. 生成 Release 密钥并打包 (每次构建签名不同，覆盖安装需先卸载旧版)
+      - name: Generate Key & Build Release APK
+        run: |
+          rm -f app/release.keystore
+          keytool -genkeypair -v \
+            -keystore app/release.keystore \
+            -alias androidreleasekey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android,OU=Android,O=Android,L=Unknown,ST=Unknown,C=US"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleOtherRelease \
+            -Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androidreleasekey \
+            -Pandroid.injected.signing.key.password=android \
+            --stacktrace
+
+      # 7. 上传 arm64-v8a 安装包
+      - name: Upload APK Product
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-arm64-v8a-naive-release-apk
+          path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
+
+  # ------------------------------------------------------------------
+  # B. 命令行二进制: windows-amd64 / linux-amd64-musl / linux-arm64
+  #    - windows: CGO_ENABLED=0 + with_purego, 另带 libcronet.dll
+  #    - linux:   CGO + Chromium toolchain (cronet-go/cmd/build-naive), musl 加 with_musl
+  # ------------------------------------------------------------------
+  binaries:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            cgo: '0'
+            bin: sing-box.exe
+            extra_tags: ',with_purego'
+            libc_flag: ''
+            archive: zip
+          - name: linux-amd64-musl
+            goos: linux
+            goarch: amd64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
+            archive: tar
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ''
+            libc_flag: ''
+            archive: tar
+
+    steps:
+      - name: Clone core (dateblue/intel)
+        run: |
+          set -euo pipefail
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" core
+          else
+            git clone --depth 1 "$CORE_REPO" core
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+          cache: false
+
+      # cronet-go 版本: 优先用核心仓库的 .github/CRONET_GO_VERSION, 否则取 go.mod 里 cronet-go/all 的 commit
+      - name: Resolve cronet-go version
+        run: |
+          set -euo pipefail
+          if [ -s core/.github/CRONET_GO_VERSION ]; then
+            V=$(tr -d '[:space:]' < core/.github/CRONET_GO_VERSION)
+          else
+            V=$(grep -oE 'cronet-go/all v[^ ]+' core/go.mod | head -n1 | awk '{print $2}' | sed -E 's/.*-([0-9a-f]{12})$/\1/')
+          fi
+          test -n "$V"
+          echo "cronet-go version: $V"
+          echo "CRONET_GO_VERSION=$V" >> "$GITHUB_ENV"
+
+      # ---------------- Linux (CGO) ----------------
+      - name: Clone cronet-go
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git ~/cronet-go
+          cd ~/cronet-go
+          git sparse-checkout set --no-cone '/*' '!/lib'
+          git checkout "$CRONET_GO_VERSION"
+          git submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} download-toolchain
+
+      # 输出 CC / CXX / CGO_LDFLAGS 到后续步骤的环境变量
+      - name: Set Chromium toolchain environment
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} env >> "$GITHUB_ENV"
+
+      # ---------------- 编译 ----------------
+      - name: Build
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -xeuo pipefail
+          if [ -s core/release/LDFLAGS ]; then
+            LDFLAGS_SHARED=$(cat core/release/LDFLAGS)
+          else
+            LDFLAGS_SHARED="-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0"
+          fi
+          mkdir -p dist
+          cd core
+          go build -v -trimpath -buildvcs=false -o "../dist/${{ matrix.bin }}" \
+            -tags "${BASE_TAGS}${{ matrix.extra_tags }}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      # ---------------- Windows: purego 需要随附 libcronet.dll ----------------
+      - name: Fetch libcronet.dll
+        if: matrix.cgo == '0'
+        run: |
+          set -xeuo pipefail
+          LIB="lib/windows_${{ matrix.goarch }}/libcronet.dll"
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git "$RUNNER_TEMP/cronet-go-lib"
+          cd "$RUNNER_TEMP/cronet-go-lib"
+          git sparse-checkout set --no-cone "/$LIB"
+          git checkout "$CRONET_GO_VERSION"
+          cp "$LIB" "$GITHUB_WORKSPACE/dist/"
+          test -s "$GITHUB_WORKSPACE/dist/libcronet.dll"
+
+      - name: Package
+        run: |
+          set -xeuo pipefail
+          NAME="sing-box-${VERSION}-${{ matrix.name }}"
+          mkdir -p "pkg/${NAME}"
+          cp dist/* "pkg/${NAME}/"
+          if [ -f core/LICENSE ]; then cp core/LICENSE "pkg/${NAME}/"; fi
+          ls -l "pkg/${NAME}"
+          cd pkg
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "${NAME}.zip" "${NAME}"
+          else
+            tar -czvf "${NAME}.tar.gz" "${NAME}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ matrix.name }}
+          path: |
+            pkg/*.zip
+            pkg/*.tar.gz
+          if-no-files-found: error
