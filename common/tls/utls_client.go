@@ -82,15 +82,24 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 	return nil, E.New("unsupported usage for uTLS")
 }
 
-func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+// wrapClientConn puts the ClientHello wrappers the config asked for around the
+// raw connection: `fragment` / `record_fragment` (tlsfragment) and `spoof`. It is
+// the one place both uTLS-based clients take them from — Client() here and the
+// REALITY client, which builds its UConn by hand and, before SPEC 088, did so on
+// the bare conn, silently ignoring both fragment flags. lx: SPEC 088.
+func (c *UTLSClientConfig) wrapClientConn(conn net.Conn) (net.Conn, error) {
 	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
-	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
+	return applyTLSSpoof(conn, c.spoof, c.spoofMethod)
+}
+
+func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+	conn, err := c.wrapClientConn(conn)
 	if err != nil {
 		return nil, err
 	}
-	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
+	return newLXUTLSConn(utls.UClient(conn, c.config.Clone(), c.id), c.config.NextProtos), nil // lx: SPEC 122 — ALPN once, release the handshake state
 }
 
 func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
@@ -209,13 +218,13 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 			return nil, E.New("disable_sni is unsupported in reality")
 		}
 	}
-	if len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0 {
+	if len(options.CertificatePublicKeySHA256) > 0 {
 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
-			return nil, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
+			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
 		}
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return VerifyPinnedCertificate(options.CertificateSHA256, options.CertificatePublicKeySHA256, rawCerts)
+			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
 		}
 	}
 	if len(options.ALPN) > 0 {
@@ -366,6 +375,7 @@ func init() {
 	randomizedFingerprint = utls.HelloRandomized
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
+	lxRandomFingerprints() // lx: SPEC 123 — hybrid share and ALPN in random/randomized
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
@@ -373,6 +383,8 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
 	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
 		fallthrough
 	case "chrome", "":
+		return utls.HelloChrome_Auto, nil
+	case "chrome_155": // lx: SPEC 118 — fallback to Auto preset
 		return utls.HelloChrome_Auto, nil
 	case "firefox":
 		return utls.HelloFirefox_Auto, nil
