@@ -69,7 +69,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version-file: sing-box/go.mod
           cache: false
 
       # Gradle 打包仍使用原来的 NDK 25
