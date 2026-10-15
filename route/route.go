@@ -394,7 +394,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				continue
 			}
 			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+			if (action.OverrideDestination || metadata.SniffOverrideDestination) && M.IsDomainName(metadata.Domain) {
 				metadata.Destination = M.Socksaddr{
 					Fqdn: metadata.Domain,
 					Port: metadata.Destination.Port,
@@ -777,7 +777,7 @@ func (r *Router) actionSniff(
 		metadata.SniffError = err
 		if err == nil {
 			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+			if (action.OverrideDestination || metadata.SniffOverrideDestination) && M.IsDomainName(metadata.Domain) {
 				metadata.Destination = M.Socksaddr{
 					Fqdn: metadata.Domain,
 					Port: metadata.Destination.Port,
@@ -900,7 +900,7 @@ func (r *Router) actionSniff(
 	finally:
 		if err == nil {
 			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+			if (action.OverrideDestination || metadata.SniffOverrideDestination) && M.IsDomainName(metadata.Domain) {
 				metadata.Destination = M.Socksaddr{
 					Fqdn: metadata.Domain,
 					Port: metadata.Destination.Port,

@@ -67,6 +67,7 @@ type InboundContext struct {
 	SniffContext any
 	SnifferNames []string
 	SniffError   error
+	SniffOverrideDestination bool
 
 	// cache
 
