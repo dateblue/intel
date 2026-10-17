@@ -5,7 +5,7 @@ name: Build Custom sing-box (naive + xhttp)
 #   1. sing-box-arm64-v8a-naive-release-apk   Android arm64 APK (带 naive + xhttp)
 #   2. sing-box-windows-amd64                 sing-box.exe + libcronet.dll (purego)
 #   3. sing-box-linux-amd64-musl              CGO + musl, 适合 OpenWrt/ImmortalWrt x86
-#   4. sing-box-linux-arm64                   CGO + glibc
+#   4. sing-box-linux-arm64-musl              CGO + musl (static)
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
     steps:
       # 1. 拉取 Android 客户端外壳 (SFA)
       - name: Checkout sing-box-for-android
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: 'SagerNet/sing-box-for-android'
           submodules: 'recursive'
@@ -156,7 +156,7 @@ jobs:
           path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
 
   # ------------------------------------------------------------------
-  # B. 命令行二进制: windows-amd64 / linux-amd64-musl / linux-arm64
+  # B. 命令行二进制: windows-amd64 / linux-amd64-musl / linux-arm64-musl
   # ------------------------------------------------------------------
   binaries:
     name: ${{ matrix.name }}
@@ -182,13 +182,13 @@ jobs:
             extra_tags: ',with_musl'
             libc_flag: '--libc=musl'
             archive: tar
-          - name: linux-arm64
+          - name: linux-arm64-musl
             goos: linux
             goarch: arm64
             cgo: '1'
             bin: sing-box
-            extra_tags: ''
-            libc_flag: ''
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
             archive: tar
 
     steps:
@@ -271,6 +271,20 @@ jobs:
             -tags "${BASE_TAGS}${{ matrix.extra_tags }}" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
             ./cmd/sing-box
+
+      # Ensure Linux artifacts do not depend on a musl/glibc dynamic loader
+      - name: Verify Linux static linkage
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          file dist/sing-box
+          readelf -h dist/sing-box | grep -E 'Class:|Machine:'
+          if readelf -l dist/sing-box | grep -q 'INTERP'; then
+            echo 'ERROR: Linux binary is dynamically linked and not portable.'
+            readelf -l dist/sing-box | grep -A1 INTERP
+            exit 1
+          fi
+          echo 'PASS: no ELF interpreter required'
 
       # ---------------- Windows: purego 需要随附 libcronet.dll ----------------
       - name: Fetch libcronet.dll
