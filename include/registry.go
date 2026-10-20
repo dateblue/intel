@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/block"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing-box/protocol/redirect"
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
@@ -26,9 +27,9 @@ import (
 	"github.com/sagernet/sing-box/service/resolved"
 )
 
-// Context provides the required registries for the user's five transports:
-// VLESS with XHTTP/REALITY, Naive, Hysteria2 and TUIC v5.
-// The management, DNS and local transparent-proxy building blocks are retained.
+// Registries for the requested proxy protocols, client and server where supported.
+// XHTTP is currently a client-only VLESS transport; REALITY server TLS is
+// available via the VLESS inbound. Keep platform TUN/TProxy, DNS and APIs.
 func Context(ctx context.Context) context.Context {
 	return box.Context(ctx, InboundRegistry(), OutboundRegistry(), EndpointRegistry(), DNSTransportRegistry(), ServiceRegistry(), CertificateProviderRegistry())
 }
@@ -36,12 +37,16 @@ func Context(ctx context.Context) context.Context {
 func InboundRegistry() *inbound.Registry {
 	registry := inbound.NewRegistry()
 
-	// Local transparent-proxy entry points, plus TUIC v5 server on Oracle ARM64 VPS.
+	// Local transparent proxy (Windows/Android VPN and ImmortalWrt).
 	tun.RegisterInbound(registry)
 	redirect.RegisterRedirect(registry)
 	redirect.RegisterTProxy(registry)
 	direct.RegisterInbound(registry)
-	registerQUICInbounds(registry) // TUIC v5 server
+
+	// Protocol server inbounds. VLESS is the REALITY server entry point.
+	vless.RegisterInbound(registry)
+	naive.RegisterInbound(registry)
+	registerQUICInbounds(registry) // Hysteria2 and TUIC v5.
 
 	return registry
 }
@@ -49,30 +54,28 @@ func InboundRegistry() *inbound.Registry {
 func OutboundRegistry() *outbound.Registry {
 	registry := outbound.NewRegistry()
 
-	// Routing and outbound groups required by existing user configs.
+	// Base routes/groups, required by configs and platform controllers.
 	direct.RegisterOutbound(registry)
 	block.RegisterOutbound(registry)
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
 
-	// VLESS carries both XHTTP+REALITY and REALITY/Vision.
+	// VLESS carries REALITY/Vision and XHTTP+REALITY.
 	vless.RegisterOutbound(registry)
 	registerNaiveOutbound(registry)
-	registerQUICOutbounds(registry) // Hysteria2 and TUIC v5 only.
+	registerQUICOutbounds(registry) // Hysteria2 and TUIC v5.
 
 	return registry
 }
 
 func EndpointRegistry() *endpoint.Registry {
-	// Client-only build: WireGuard/OpenVPN/OpenConnect/MASQUE/Tailscale
-	// endpoints are intentionally unavailable.
+	// No unused WireGuard/OpenVPN/OpenConnect/MASQUE/Tailscale endpoints.
 	return endpoint.NewRegistry()
 }
 
 func DNSTransportRegistry() *dns.TransportRegistry {
 	registry := dns.NewTransportRegistry()
 
-	// Preserve standard DNS transports for Windows/Android/ImmortalWrt.
 	transport.RegisterTCP(registry)
 	transport.RegisterUDP(registry)
 	transport.RegisterTLS(registry)
@@ -83,9 +86,8 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 	fakeip.RegisterTransport(registry)
 	resolved.RegisterTransport(registry)
 
-	// DoQ / HTTP3 DNS remain available for the Wrt configuration.
-	registerQUICTransports(registry)
-	// No registerDHCPTransport: with_dhcp is deliberately excluded.
+	registerQUICTransports(registry) // DoQ and HTTP/3 DNS.
+	// DHCP DNS discovery deliberately excluded (no with_dhcp tag).
 
 	return registry
 }
@@ -93,10 +95,9 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 func ServiceRegistry() *service.Registry {
 	registry := service.NewRegistry()
 
-	// Keep platform-management services. No Shadowsocks manager or
-	// server-side Hysteria realm is registered.
 	api.RegisterService(registry)
 	resolved.RegisterService(registry)
+	registerQUICServices(registry) // Hysteria2 realm (server feature).
 	registerOOMKillerService(registry)
 
 	return registry
