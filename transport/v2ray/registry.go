@@ -1,6 +1,6 @@
 package v2ray
 
-// lx: client transport registry.
+// lx: extensible client/server transport registries.
 //
 // Upstream selects the client transport with a hardcoded switch in
 // NewClientTransport (transport.go). sing-box-lx replaces that switch with this
@@ -19,9 +19,27 @@ import (
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing-box/transport/v2rayhttpupgrade"
 	"github.com/sagernet/sing-box/transport/v2raywebsocket"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+// ServerTransportConstructor builds one inbound transport implementation.
+// It is deliberately independent of client registration so experimental
+// transports can add a server without changing the built-in switch.
+type ServerTransportConstructor func(ctx context.Context, logger logger.ContextLogger, options option.V2RayTransportOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (adapter.V2RayServerTransport, error)
+
+var serverTransportRegistry = make(map[string]ServerTransportConstructor)
+
+// RegisterServer registers an inbound transport constructor during init.
+func RegisterServer(transportType string, constructor ServerTransportConstructor) {
+	serverTransportRegistry[transportType] = constructor
+}
+
+func lookupServerTransport(transportType string) (ServerTransportConstructor, bool) {
+	constructor, loaded := serverTransportRegistry[transportType]
+	return constructor, loaded
+}
 
 // ClientTransportConstructor builds a client transport from the full
 // V2RayTransportOptions (each transport reads its own sub-options field).

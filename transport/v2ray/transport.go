@@ -40,6 +40,9 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewServer(ctx, logger, options.HTTPUpgradeOptions, tlsConfig, handler)
 	default:
+		if constructor, loaded := lookupServerTransport(options.Type); loaded {
+			return constructor(ctx, logger, options, tlsConfig, handler)
+		}
 		return nil, E.New("unknown transport type: " + options.Type)
 	}
 }

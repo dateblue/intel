@@ -162,6 +162,9 @@ func (c *RealityServerConfig) ServerName() string {
 
 func (c *RealityServerConfig) SetServerName(serverName string) {
 	c.config.ServerName = serverName
+	// REALITY uses ServerNames as its SNI allowlist. Keep it in sync when
+	// callers override the server name after construction.
+	c.config.ServerNames = map[string]bool{serverName: true}
 }
 
 func (c *RealityServerConfig) NextProtos() []string {

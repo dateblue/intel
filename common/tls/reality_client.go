@@ -228,7 +228,13 @@ func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *r
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
 			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+				// Rebuild the marshaled ClientHello after changing ALPN, before
+				// sealing the REALITY SessionID. Keep the behavior consistent
+				// with utlsALPNWrapper.HandshakeContext.
 				alpnExtension.AlpnProtocols = uConfig.NextProtos
+				if err = uConn.BuildHandshakeState(); err != nil {
+					return nil, nil, E.Cause(err, "rebuild reality ClientHello with ALPN")
+				}
 				break
 			}
 		}
@@ -253,11 +259,8 @@ func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *r
 	hello.SessionId[0] = 26
 	hello.SessionId[1] = 3
 	hello.SessionId[2] = 27
-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(nowTime.Unix()))
 	copy(hello.SessionId[8:], e.shortID[:])
-	if debug.Enabled {
-		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
-	}
 	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
 	if err != nil {
 		return nil, nil, err
@@ -292,10 +295,6 @@ func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *r
 	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
 	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
 	copy(hello.Raw[39:], hello.SessionId)
-	if debug.Enabled {
-		fmt.Printf("REALITY hello.sessionId: %v\n", hello.SessionId)
-		fmt.Printf("REALITY uConn.AuthKey: %v\n", authKey)
-	}
 	return uConn, verifier, nil
 }
 
