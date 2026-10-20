@@ -3,35 +3,23 @@
 package include
 
 import (
-	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
-	"github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport/quic"
-	"github.com/sagernet/sing-box/protocol/hysteria"
 	"github.com/sagernet/sing-box/protocol/hysteria2"
 	_ "github.com/sagernet/sing-box/protocol/naive/quic"
 	"github.com/sagernet/sing-box/protocol/tuic"
-	_ "github.com/sagernet/sing-box/transport/v2rayquic"
 )
 
-func registerQUICInbounds(registry *inbound.Registry) {
-	hysteria.RegisterInbound(registry)
-	tuic.RegisterInbound(registry)
-	hysteria2.RegisterInbound(registry)
-}
-
+// Only the client outbounds in use. No Hysteria v1, QUIC server inbounds,
+// server-side realm, or V2Ray QUIC transport registration.
 func registerQUICOutbounds(registry *outbound.Registry) {
-	hysteria.RegisterOutbound(registry)
 	tuic.RegisterOutbound(registry)
 	hysteria2.RegisterOutbound(registry)
 }
 
+// DoQ and HTTP/3 DNS remain available.
 func registerQUICTransports(registry *dns.TransportRegistry) {
 	quic.RegisterTransport(registry)
 	quic.RegisterHTTP3Transport(registry)
-}
-
-func registerQUICServices(registry *service.Registry) {
-	hysteria2.RegisterRealmService(registry)
 }
