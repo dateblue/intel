@@ -3,6 +3,7 @@
 package include
 
 import (
+	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport/quic"
@@ -11,8 +12,13 @@ import (
 	"github.com/sagernet/sing-box/protocol/tuic"
 )
 
-// Only the client outbounds in use. No Hysteria v1, QUIC server inbounds,
-// server-side realm, or V2Ray QUIC transport registration.
+// Keep TUIC v5 server support for the Oracle ARM64 VPS.
+func registerQUICInbounds(registry *inbound.Registry) {
+	tuic.RegisterInbound(registry)
+}
+
+// Only the outbounds in use: TUIC v5 and Hysteria2.
+// No Hysteria v1 or V2Ray QUIC transport registration.
 func registerQUICOutbounds(registry *outbound.Registry) {
 	tuic.RegisterOutbound(registry)
 	hysteria2.RegisterOutbound(registry)

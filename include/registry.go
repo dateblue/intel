@@ -26,7 +26,7 @@ import (
 	"github.com/sagernet/sing-box/service/resolved"
 )
 
-// Context provides the client-only registries for the user's five transports:
+// Context provides the required registries for the user's five transports:
 // VLESS with XHTTP/REALITY, Naive, Hysteria2 and TUIC v5.
 // The management, DNS and local transparent-proxy building blocks are retained.
 func Context(ctx context.Context) context.Context {
@@ -36,11 +36,12 @@ func Context(ctx context.Context) context.Context {
 func InboundRegistry() *inbound.Registry {
 	registry := inbound.NewRegistry()
 
-	// Local transparent-proxy entry points. No proxy-server inbounds are linked.
+	// Local transparent-proxy entry points, plus TUIC v5 server on Oracle ARM64 VPS.
 	tun.RegisterInbound(registry)
 	redirect.RegisterRedirect(registry)
 	redirect.RegisterTProxy(registry)
 	direct.RegisterInbound(registry)
+	registerQUICInbounds(registry) // TUIC v5 server
 
 	return registry
 }
