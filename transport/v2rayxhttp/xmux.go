@@ -464,20 +464,51 @@ func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
 		return m.newClientLocked(), 0
 	}
 
-	candidates := m.clients
-	if m.concurrency > 0 {
-		candidates = make([]*xmuxClient, 0, len(m.clients))
-		for _, client := range m.clients {
-			if client.getOpenUsage() < m.concurrency {
-				candidates = append(candidates, client)
+	// Prefer a connection with no outstanding failure streak. One transport
+	// error is not enough to trip the circuit breaker, but it is a useful
+	// warning when choosing where to put the NEXT stream. In particular, a
+	// healthy HTTP/2 connection should not lose half of new streams to a
+	// different connection that has recently failed a request.
+	//
+	// Do not evict or forcibly close a suspect connection here: its active
+	// streams must be allowed to finish, and the existing three-failure
+	// breaker/backoff still protects against dial storms. When there are no
+	// healthy candidates, fall back to the least-suspect eligible connection
+	// instead of opening extra transports beyond max_connections.
+	//
+	// Reservoir sampling preserves randomized selection between equally
+	// healthy candidates without allocating a temporary candidate slice.
+	var healthy, suspect *xmuxClient
+	var healthyCount, suspectCount int
+	minFailures := int32(maxInt32)
+	for _, candidate := range m.clients {
+		if m.concurrency > 0 && candidate.getOpenUsage() >= m.concurrency {
+			continue
+		}
+		failures := candidate.consecFails.Load()
+		if failures == 0 {
+			healthyCount++
+			if randIntn(healthyCount) == 0 {
+				healthy = candidate
+			}
+		} else if failures <= minFailures {
+			if failures < minFailures {
+				minFailures = failures
+				suspectCount = 0
+			}
+			suspectCount++
+			if randIntn(suspectCount) == 0 {
+				suspect = candidate
 			}
 		}
 	}
-	if len(candidates) == 0 {
+	client := healthy
+	if client == nil {
+		client = suspect
+	}
+	if client == nil {
 		return m.newClientLocked(), 0
 	}
-
-	client := candidates[randIntn(len(candidates))]
 	if client.leftUsage > 0 {
 		client.leftUsage--
 	}

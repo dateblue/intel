@@ -3,7 +3,6 @@
 package tls
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -22,10 +21,8 @@ import (
 	mRand "math/rand"
 	"net"
 	"net/http"
-	"reflect"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -185,7 +182,6 @@ func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *r
 		return nil, nil, err
 	}
 	uConn := utls.UClient(conn, uConfig, e.uClient.id)
-	verifier.UConn = uConn
 	// lx: SPEC 083 — апстрим здесь вырезал X25519MLKEM768 из supported_groups
 	// и key_share (костыль под utls v1.7.2, где Ecdhe гибрида и чистого X25519
 	// не различались). XTLS/REALITY@8cdf7bf (Xray ≥ v26.9.8) отвергает
@@ -318,28 +314,38 @@ func realityHelloCarriesHybridShare(uConn *utls.UConn) bool {
 	return false
 }
 
+// The camouflage request uses the same TLS connection after REALITY verification
+// fails. Bound its lifetime so an unresponsive destination cannot hold the
+// connection and its goroutine indefinitely.
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
 	defer uConn.Close()
-	client := &http.Client{
-		Transport: &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, config *tls.Config) (net.Conn, error) {
-				return uConn, nil
-			},
-			TLSClientConfig: &tls.Config{
-				Time:    ntp.TimeFuncFromContext(ctx),
-				RootCAs: adapter.RootPoolFromContext(ctx),
-			},
+	const fallbackTimeout = 15 * time.Second
+	fallbackCtx, cancel := context.WithTimeout(ctx, fallbackTimeout)
+	defer cancel()
+
+	transport := &http2.Transport{
+		DialTLSContext: func(_ context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			return uConn, nil
+		},
+		TLSClientConfig: &tls.Config{
+			Time:    ntp.TimeFuncFromContext(ctx),
+			RootCAs: adapter.RootPoolFromContext(ctx),
 		},
 	}
-	request, _ := http.NewRequest("GET", "https://"+serverName, nil)
-	request.Header.Set("User-Agent", fingerprint.Client)
-	request.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", mRand.Intn(32)+30)})
-	response, err := client.Do(request)
+	defer transport.CloseIdleConnections()
+
+	request, err := http.NewRequestWithContext(fallbackCtx, http.MethodGet, "https://"+serverName, nil)
 	if err != nil {
 		return
 	}
+	request.Header.Set("User-Agent", fingerprint.Client)
+	request.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", mRand.Intn(32)+30)})
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return
+	}
+	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, response.Body)
-	response.Body.Close()
 }
 
 func (e *RealityClientConfig) Clone() Config {
@@ -353,34 +359,45 @@ func (e *RealityClientConfig) Clone() Config {
 }
 
 type realityVerifier struct {
-	*utls.UConn
 	serverName string
 	authKey    []byte
 	verified   bool
 }
 
-func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-	p, _ := reflect.TypeFor[utls.Conn]().FieldByName("peerCertificates")
-	certs := *(*([]*x509.Certificate))(unsafe.Add(unsafe.Pointer(c.Conn), p.Offset))
-	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
+func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	// uTLS already parsed these certificates before calling this verifier.
+	// Parse the provided DER instead of reading private uTLS fields with unsafe:
+	// this remains compatible if the internal utls.Conn layout changes.
+	if len(rawCerts) == 0 {
+		return E.New("reality: server returned no certificates")
+	}
+	leaf, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return E.Cause(err, "reality: parse server certificate")
+	}
+	if pub, ok := leaf.PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.authKey)
-		h.Write(pub)
-		if bytes.Equal(h.Sum(nil), certs[0].Signature) {
+		_, _ = h.Write(pub)
+		if hmac.Equal(h.Sum(nil), leaf.Signature) {
 			c.verified = true
 			return nil
 		}
 	}
+	// A normal, trusted certificate means we reached the camouflage destination
+	// rather than the REALITY server. The caller handles the fallback request.
 	opts := x509.VerifyOptions{
 		DNSName:       c.serverName,
 		Intermediates: x509.NewCertPool(),
 	}
-	for _, cert := range certs[1:] {
+	for _, raw := range rawCerts[1:] {
+		cert, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return E.Cause(err, "reality: parse intermediate certificate")
+		}
 		opts.Intermediates.AddCert(cert)
 	}
-	if _, err := certs[0].Verify(opts); err != nil {
-		return err
-	}
-	return nil
+	_, err = leaf.Verify(opts)
+	return err
 }
 
 type realityClientConnWrapper struct {
