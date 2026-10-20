@@ -59,9 +59,8 @@ func TestDefaultLegacyPadding(t *testing.T) {
 	if !strings.Contains(referer, "x_padding=") {
 		t.Fatalf("Referer %q has no x_padding query", referer)
 	}
-	// padding value must be 100 '0' bytes — the legacy non-obfs filler, kept
-	// byte-identical to the live-verified v1 default.
-	want := "x_padding=" + strings.Repeat("0", 100)
+	// The default filler now matches Xray's repeat-x padding length on the wire.
+	want := "x_padding=" + strings.Repeat("X", 100)
 	if !strings.Contains(referer, want) {
 		t.Fatalf("Referer %q missing %q", referer, want)
 	}

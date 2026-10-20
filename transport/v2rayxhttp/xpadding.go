@@ -24,9 +24,11 @@ func randIntn(n int) int {
 
 // applyXPadding attaches the X-Padding obfuscation to a request.
 //
-// Non-obfs (default, x_padding_obfs_mode=false): the padding is carried as a
-// "x_padding=<pad>" query parameter inside the Referer header — exactly the legacy
-// Xray behavior the v1 client shipped and which is live-verified against Xray/3x-ui.
+// Non-obfs (default, x_padding_obfs_mode=false): the padding is carried as
+// "x_padding=<pad>" inside the Referer query, matching the Xray request shape.
+// The default filler is 'X' (8-bit Huffman code point), matching Xray's current
+// GeneratePadding(repeat-x) behavior instead of '0' (5-bit Huffman code point).
+// This matters for the actual HTTP/2 HPACK-encoded header length.
 //
 // Obfs (x_padding_obfs_mode=true): the padding is placed per x_padding_placement
 // (cookie|header|query|queryInHeader) under x_padding_key / x_padding_header, with
@@ -34,17 +36,13 @@ func randIntn(n int) int {
 func (c *Client) applyXPadding(request *http.Request) {
 	m := &c.meta
 	if !m.xPaddingObfsMode {
-		// Legacy: x_padding query inside the Referer header. The padding bytes are
-		// literal '0' (not 'X') to stay byte-identical to the live-verified v1
-		// default — the server validates length only, so the filler byte is free,
-		// and keeping '0' avoids changing the on-wire default that was confirmed
-		// against Xray/3x-ui. obfs mode below uses the configured repeat-x ('X') /
-		// tokenish generator instead.
+		// Keep legacy Referer placement, but use Xray's current default filler
+		// so HPACK length is not shortened by '0' Huffman coding.
 		n := c.paddingRange.rand()
 		if n <= 0 {
 			return
 		}
-		pad := strings.Repeat("0", n)
+		pad := strings.Repeat("X", n)
 		referer := &url.URL{Scheme: c.scheme, Host: c.host, Path: request.URL.Path}
 		rq := referer.Query()
 		rq.Set("x_padding", pad)

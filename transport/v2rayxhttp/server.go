@@ -6,8 +6,11 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/badhttp"
@@ -46,6 +49,8 @@ type Server struct {
 	httpServer *http.Server
 	h2Server   *http2.Server
 	h2cHandler http.Handler
+	// Diagnostics are opt-in. 0 means no per-frame timing overhead.
+	slowWriteThreshold time.Duration
 }
 
 func NewServer(ctx context.Context, logger logger.ContextLogger, options option.V2RayXHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
@@ -73,11 +78,20 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 		return nil, err
 	}
 	h2 := &http2.Server{}
+	// Opt-in diagnostics for high-load stream-one stalls. Never tweak HTTP/2
+	// flow-control defaults as a side effect of enabling diagnostics.
+	var slowWriteThreshold time.Duration
+	if raw := os.Getenv("SING_BOX_XHTTP_SLOW_MS"); raw != "" {
+		ms, parseErr := strconv.Atoi(raw)
+		if parseErr == nil && ms > 0 && ms <= 60000 {
+			slowWriteThreshold = time.Duration(ms) * time.Millisecond
+		}
+	}
 	headerBytes := options.ServerMaxHeaderBytes
 	if headerBytes <= 0 {
 		headerBytes = http.DefaultMaxHeaderBytes
 	}
-	s := &Server{tlsConfig: tlsConfig, handler: handler, logger: logger, path: path, method: method, host: options.Host, noSSE: options.NoSSEHeader, padding: padding, h2Server: h2}
+	s := &Server{tlsConfig: tlsConfig, handler: handler, logger: logger, path: path, method: method, host: options.Host, noSSE: options.NoSSEHeader, padding: padding, h2Server: h2, slowWriteThreshold: slowWriteThreshold}
 	s.httpServer = &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: C.TCPTimeout,
@@ -121,6 +135,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Xray's default XHTTP padding check happens after path/host matching.
+	// With obfs mode disabled the value is in Referer?x_padding=..., or
+	// in the request URL query when Referer is absent. Length, not content,
+	// is validated: accept existing clients which still send '0' padding.
+	// Generate the response padding before validation, as Xray does, so
+	// a malformed request on the correct path also receives the header.
+	if n := s.padding.rand(); n > 0 {
+		w.Header().Set("X-Padding", strings.Repeat("X", n))
+	}
+	if !validLegacyRequestPadding(r, s.padding) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
@@ -131,14 +158,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.noSSE {
 		w.Header().Set("Content-Type", "text/event-stream")
 	}
-	// Xray uses an X-Padding response header by default; it is header-only
-	// noise and must never enter the VLESS data stream.
-	if n := s.padding.rand(); n > 0 {
-		w.Header().Set("X-Padding", strings.Repeat("0", n))
-	}
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// Only turn on transport timing when explicitly requested. These timings
+	// isolate stalls inside ResponseWriter.Write or Flush (HTTP/2 flow control)
+	// from waiting on the client request body or the VLESS outbound.
+	if s.slowWriteThreshold > 0 && s.logger != nil {
+		wrapped := &xhttpSlowResponseWriter{
+			ResponseWriter: w,
+			flusher:        flusher,
+			threshold:      s.slowWriteThreshold,
+			warn: func(op string, took time.Duration) {
+				s.logger.WarnContext(r.Context(), "xhttp stream-one slow ", op,
+					" elapsed=", took, " remote=", r.RemoteAddr)
+			},
+		}
+		w = wrapped
+		flusher = wrapped
+	}
 	done := make(chan struct{})
 	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
 		HTTP2Conn: v2rayhttp.NewHTTPConn(r.Body, w),
@@ -154,6 +192,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.CloseWrapper()
 }
 
+// validLegacyRequestPadding mirrors Xray's default non-obfuscated XHTTP
+// request-padding extraction and range check. Xray validates length only,
+// not the filler content. This also keeps old '0'-padding clients compatible.
+func validLegacyRequestPadding(r *http.Request, padding intRange) bool {
+	if r == nil {
+		return false
+	}
+	var value string
+	if referer := r.Header.Get("Referer"); referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil {
+			return false
+		}
+		value = u.Query().Get("x_padding")
+	} else {
+		value = r.URL.Query().Get("x_padding")
+	}
+	return len(value) > 0 && len(value) >= padding.min && len(value) <= padding.max
+}
+
 func (s *Server) Network() []string { return []string{N.NetworkTCP} }
 
 func (s *Server) Serve(listener net.Listener) error {
@@ -166,3 +224,30 @@ func (s *Server) Serve(listener net.Listener) error {
 
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
 func (s *Server) Close() error                     { return common.Close(common.PtrOrNil(s.httpServer)) }
+
+// xhttpSlowResponseWriter wraps only the already-accepted response body.
+// It deliberately doesn't buffer, batch, or rewrite frames. Writes and Flush
+// retain their exact ordering. It is not a throughput optimization.
+type xhttpSlowResponseWriter struct {
+	http.ResponseWriter
+	flusher   http.Flusher
+	threshold time.Duration
+	warn      func(string, time.Duration)
+}
+
+func (w *xhttpSlowResponseWriter) Write(p []byte) (int, error) {
+	start := time.Now()
+	n, err := w.ResponseWriter.Write(p)
+	if elapsed := time.Since(start); elapsed >= w.threshold && w.warn != nil {
+		w.warn("Write", elapsed)
+	}
+	return n, err
+}
+
+func (w *xhttpSlowResponseWriter) Flush() {
+	start := time.Now()
+	w.flusher.Flush()
+	if elapsed := time.Since(start); elapsed >= w.threshold && w.warn != nil {
+		w.warn("Flush", elapsed)
+	}
+}

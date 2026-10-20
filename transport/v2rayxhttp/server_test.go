@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
@@ -80,8 +81,8 @@ func TestXHTTPServerOnlyHTTP2BarePath(t *testing.T) {
 }
 
 func TestXHTTPServerStreamOneEcho(t *testing.T) {
-	s := &Server{path: "/xhttp/", method: http.MethodPost, handler: &echoTransportHandler{}}
-	req := httptest.NewRequest(http.MethodPost, "https://test.invalid/xhttp/?x_padding=123", io.NopCloser(io.LimitReader(&oneShotReader{data: []byte("ping")}, 4)))
+	s := &Server{path: "/xhttp/", method: http.MethodPost, handler: &echoTransportHandler{}, padding: intRange{100, 100}}
+	req := httptest.NewRequest(http.MethodPost, "https://test.invalid/xhttp/?x_padding="+strings.Repeat("X", 100), io.NopCloser(io.LimitReader(&oneShotReader{data: []byte("ping")}, 4)))
 	req.ProtoMajor = 2
 	req.ProtoMinor = 0
 	rec := httptest.NewRecorder()
@@ -91,6 +92,49 @@ func TestXHTTPServerStreamOneEcho(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != "ping" {
 		t.Fatalf("body = %q, want ping", got)
+	}
+}
+
+func TestXHTTPServerDefaultPaddingValidation(t *testing.T) {
+	padX := strings.Repeat("X", 100)
+	padZero := strings.Repeat("0", 100)
+	tests := []struct {
+		name, referer, rawQuery string
+		wantStatus              int
+	}{
+		{"missing", "", "", http.StatusBadRequest},
+		{"short", "https://test.invalid/xhttp/?x_padding=X", "", http.StatusBadRequest},
+		{"long", "https://test.invalid/xhttp/?x_padding=" + strings.Repeat("X", 101), "", http.StatusBadRequest},
+		{"malformed Referer", "%", "x_padding=" + padX, http.StatusBadRequest},
+		{"valid Referer", "https://test.invalid/xhttp/?x_padding=" + padX, "", http.StatusOK},
+		{"valid existing zero padding", "https://test.invalid/xhttp/?x_padding=" + padZero, "", http.StatusOK},
+		{"valid URL query fallback", "", "x_padding=" + padX, http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{path: "/xhttp/", method: http.MethodPost, padding: intRange{100, 100}, handler: &echoTransportHandler{}}
+			url := "https://test.invalid/xhttp/"
+			if tc.rawQuery != "" {
+				url += "?" + tc.rawQuery
+			}
+			req := httptest.NewRequest(http.MethodPost, url, strings.NewReader("ping"))
+			req.ProtoMajor = 2
+			req.ProtoMinor = 0
+			if tc.referer != "" {
+				req.Header.Set("Referer", tc.referer)
+			}
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status=%d; want=%d", rec.Code, tc.wantStatus)
+			}
+			if got := rec.Header().Get("X-Padding"); got != padX {
+				t.Fatalf("response padding length=%d or content mismatch", len(got))
+			}
+			if tc.wantStatus == http.StatusOK && rec.Body.String() != "ping" {
+				t.Fatalf("body=%q", rec.Body.String())
+			}
+		})
 	}
 }
 
