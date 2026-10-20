@@ -1,0 +1,377 @@
+name: Build Minimal Client sing-box (5 protocols)
+
+# 放到仓库的 .github/workflows/build-xhttp.yml
+# 精简协议注册文件：include/registry.go、include/quic.go（需先推送到 pqc-new）
+# 注意：移除了本地 SOCKS/HTTP/Mixed 入站，仅保留 TUN/Redirect/TProxy。
+# 产物:
+#   1. sing-box-arm64-v8a-naive-release-apk   Android arm64 APK (带 naive + xhttp)
+#   2. sing-box-windows-amd64                 sing-box.exe + libcronet.dll (purego)
+#   3. sing-box-linux-amd64-musl              CGO + musl, 适合 OpenWrt/ImmortalWrt x86
+#   4. sing-box-linux-arm64-musl              CGO + musl (static)
+
+on:
+  push:
+    branches:
+      - pqc-new
+    paths:
+      - '.github/workflows/build-xhttp.yml'
+      - 'include/registry.go'
+      - 'include/quic.go'
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'dateblue/intel 的分支或 tag (留空 = pqc-new)'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: '写入二进制的版本号'
+        required: false
+        default: '1.15.0-custom-naive-xhttp'
+        type: string
+
+env:
+  CORE_REPO: https://github.com/dateblue/intel.git
+  CORE_REF: ${{ inputs.core_ref || 'pqc-new' }}
+  VERSION: ${{ inputs.version || '1.15.0-custom-naive-xhttp' }}
+# 保留 QUIC(DNS/HY2/TUIC)、uTLS(REALITY/PQC)、Clash API(Wrt)、Naive、XHTTP。
+  # with_naive 在这份源码中并非 Naive 的有效编译开关；with_naive_outbound 才是。
+  # 不启用 with_dhcp：用户使用独立路由器 DHCP/RA，且不需要 DHCP DNS。
+  BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,with_xhttp,badlinkname,tfogo_checklinkname0
+
+jobs:
+  # ------------------------------------------------------------------
+  # A. Android APK (arm64, 保留 naive + xhttp)
+  # ------------------------------------------------------------------
+  apk:
+    name: Android APK (arm64, naive, xhttp)
+    runs-on: ubuntu-24.04
+
+    steps:
+      # 1. 拉取 Android 客户端外壳 (SFA)
+      - name: Checkout sing-box-for-android
+        uses: actions/checkout@v7
+        with:
+          repository: 'SagerNet/sing-box-for-android'
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # 2. 将官方 sing-box 核心替换为自定义的 dateblue/intel 代码
+      - name: Replace core with custom dateblue/intel
+        run: |
+          rm -rf sing-box
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" sing-box
+          else
+            git clone --depth 1 "$CORE_REPO" sing-box
+          fi
+          echo "Android core SHA: $(git -C sing-box rev-parse HEAD)"
+          # Fail closed if the intended client-only registry is not yet pushed.
+          grep -Fq 'vless.RegisterOutbound(registry)' sing-box/include/registry.go
+          grep -Fq 'registerNaiveOutbound(registry)' sing-box/include/registry.go
+          grep -Fq 'hysteria2.RegisterOutbound(registry)' sing-box/include/quic.go
+          grep -Fq 'tuic.RegisterOutbound(registry)' sing-box/include/quic.go
+          if grep -Eq '(shadowsocks|vmess|trojan|snell|hysteria)\.Register(Outbound|Inbound)' sing-box/include/registry.go sing-box/include/quic.go; then
+            echo 'ERROR: unused protocol registrations still present'; exit 1
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: sing-box/go.mod
+          cache: true
+          cache-dependency-path: sing-box/go.sum
+
+      # Gradle 打包仍使用原来的 NDK 25
+      - name: Setup Android SDK & NDK 25
+        id: setup-android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      # naive (cronet) 的 cgo 链接用 NDK r28, 与上游 release 一致
+      - name: Setup Android NDK r28 (for libbox)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      # 3. 精简 libbox 构建标签：去掉 wireguard / usbip / openvpn / openconnect / tailscale
+      #    保留 quic / utls / clash_api / naive_outbound / xhttp
+      - name: Slim libbox build tags (keep naive & xhttp)
+        run: |
+          F=sing-box/cmd/internal/build_libbox/main.go
+          sed -i 's/"with_wireguard", //; s/"with_usbip", //; s/"with_openvpn", //; s/"with_openconnect", //' "$F"
+          sed -i '/sharedTags = append(sharedTags, "with_tailscale"/d' "$F"
+          echo "---- sharedTags lines after patch ----"
+          grep -n 'sharedTags = append' "$F"
+          if grep 'sharedTags = append' "$F" | grep -qE 'with_(wireguard|usbip|openvpn|openconnect|tailscale)'; then
+            echo "slimming failed: heavy tags still present"; exit 1
+          fi
+          if ! grep 'sharedTags = append' "$F" | grep -q 'with_naive_outbound'; then
+            echo "with_naive_outbound missing from sharedTags"; exit 1
+          fi
+          # 【改动 2】检查并确保 Android libbox 标签中包含 with_xhttp
+          if ! grep 'sharedTags = append' "$F" | grep -q 'with_xhttp'; then
+            echo "with_xhttp missing from sharedTags, appending..."
+            sed -i '/sharedTags = append(sharedTags/s/)/, "with_xhttp")/' "$F"
+          fi
+
+      # 4. 编译核心 (仅 arm64)
+      - name: Build Libbox Core (arm64, naive, xhttp)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cd sing-box
+          go run ./cmd/internal/build_libbox -target android -platform android/arm64
+          mkdir -p ../app/libs
+          cp libbox.aar ../app/libs/libbox.aar
+
+      # 5. 检查 libbox.so 体积; cronet-go 应当存在 (说明 naive 已编入)
+      - name: Inspect libbox
+        run: |
+          rm -rf /tmp/aar && mkdir -p /tmp/aar
+          unzip -o app/libs/libbox.aar 'jni/arm64-v8a/libbox.so' -d /tmp/aar
+          ls -l /tmp/aar/jni/arm64-v8a/libbox.so
+          for k in 'tailscale.com/' 'golang.zx2c4.com/wireguard' 'cronet-go'; do
+            echo "$k : $(grep -a -c -i "$k" /tmp/aar/jni/arm64-v8a/libbox.so || true)"
+          done
+
+      # 6. APK 签名：有 Secrets 时使用固定密钥；否则保持临时签名兼容旧流程。
+      # 首次启用固定密钥，可能无法覆盖安装之前使用随机临时密钥签署的 APK。
+      # GitHub Secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+      #                 ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+      - name: Sign and Build Release APK
+        env:
+          KEY_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          rm -f app/release.keystore
+          if [ -n "$KEY_B64" ]; then
+            : "${STORE_PASS:?ANDROID_KEYSTORE_PASSWORD is missing}"
+            : "${KEY_ALIAS:?ANDROID_KEY_ALIAS is missing}"
+            : "${KEY_PASS:?ANDROID_KEY_PASSWORD is missing}"
+            printf '%s' "$KEY_B64" | base64 -d > app/release.keystore
+            echo 'Using persistent Android signing key from repository secrets.'
+          else
+            echo '::warning::No Android signing secrets configured: this APK uses a new random signing key and cannot upgrade previous builds in place.'
+            STORE_PASS=android
+            KEY_ALIAS=androidreleasekey
+            KEY_PASS=android
+            keytool -genkeypair -v \
+              -keystore app/release.keystore \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=Android,OU=Android,O=Android,L=Unknown,ST=Unknown,C=US"
+          fi
+          chmod +x ./gradlew
+          ./gradlew :app:assembleOtherRelease \
+            "-Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore" \
+            "-Pandroid.injected.signing.store.password=$STORE_PASS" \
+            "-Pandroid.injected.signing.key.alias=$KEY_ALIAS" \
+            "-Pandroid.injected.signing.key.password=$KEY_PASS" \
+            --stacktrace
+
+      # 7. 上传 arm64-v8a 安装包
+      - name: Upload APK Product
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-arm64-v8a-naive-xhttp-release-apk
+          path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
+
+  # ------------------------------------------------------------------
+  # B. 命令行二进制: windows-amd64 / linux-amd64-musl / linux-arm64-musl
+  # ------------------------------------------------------------------
+  binaries:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            cgo: '0'
+            bin: sing-box.exe
+            extra_tags: ',with_purego'
+            libc_flag: ''
+            archive: zip
+          - name: linux-amd64-musl
+            goos: linux
+            goarch: amd64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
+            archive: tar
+          - name: linux-arm64-musl
+            goos: linux
+            goarch: arm64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
+            archive: tar
+
+    steps:
+      - name: Clone core (dateblue/intel)
+        run: |
+          set -euo pipefail
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" core
+          else
+            git clone --depth 1 "$CORE_REPO" core
+          fi
+          echo "CLI core SHA: $(git -C sing-box rev-parse HEAD)"
+          # Fail closed if the intended client-only registry is not yet pushed.
+          grep -Fq 'vless.RegisterOutbound(registry)' core/include/registry.go
+          grep -Fq 'registerNaiveOutbound(registry)' core/include/registry.go
+          grep -Fq 'hysteria2.RegisterOutbound(registry)' core/include/quic.go
+          grep -Fq 'tuic.RegisterOutbound(registry)' core/include/quic.go
+          if grep -Eq '(shadowsocks|vmess|trojan|snell|hysteria)\.Register(Outbound|Inbound)' core/include/registry.go core/include/quic.go; then
+            echo 'ERROR: unused protocol registrations still present'; exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: core/go.mod
+          cache: true
+          cache-dependency-path: core/go.sum
+
+      - name: Resolve cronet-go version
+        run: |
+          set -euo pipefail
+          if [ -s core/.github/CRONET_GO_VERSION ]; then
+            V=$(tr -d '[:space:]' < core/.github/CRONET_GO_VERSION)
+          else
+            V=$(grep -oE 'cronet-go/all v[^ ]+' core/go.mod | head -n1 | awk '{print $2}' | sed -E 's/.*-([0-9a-f]{12})$/\1/')
+          fi
+          test -n "$V"
+          echo "cronet-go version: $V"
+          echo "CRONET_GO_VERSION=$V" >> "$GITHUB_ENV"
+
+      # ---------------- Linux (CGO) ----------------
+      - name: Clone cronet-go
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git ~/cronet-go
+          cd ~/cronet-go
+          git sparse-checkout set --no-cone '/*' '!/lib'
+          git checkout "$CRONET_GO_VERSION"
+          git submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} download-toolchain
+
+      - name: Set Chromium toolchain environment
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} env >> "$GITHUB_ENV"
+
+      # ---------------- 编译 ----------------
+      - name: Build
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -xeuo pipefail
+          if [ -s core/release/LDFLAGS ]; then
+            LDFLAGS_SHARED=$(cat core/release/LDFLAGS)
+          else
+            LDFLAGS_SHARED="-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0"
+          fi
+          mkdir -p dist
+          cd core
+          go build -v -trimpath -buildvcs=false -o "../dist/${{ matrix.bin }}" \
+            -tags "${BASE_TAGS}${{ matrix.extra_tags }}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      # Ensure Linux artifacts do not depend on a musl/glibc dynamic loader
+      - name: Verify Linux static linkage
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          file dist/sing-box
+          readelf -h dist/sing-box | grep -E 'Class:|Machine:'
+          if readelf -l dist/sing-box | grep -q 'INTERP'; then
+            echo 'ERROR: Linux binary is dynamically linked and not portable.'
+            readelf -l dist/sing-box | grep -A1 INTERP
+            exit 1
+          fi
+          if readelf -d dist/sing-box | grep -q '(NEEDED)'; then
+            echo 'ERROR: Linux binary still has shared library dependencies.'
+            readelf -d dist/sing-box | grep '(NEEDED)'
+            exit 1
+          fi
+          echo 'PASS: no ELF interpreter or shared library dependencies'
+
+      # ---------------- Windows: purego 需要随附 libcronet.dll ----------------
+      - name: Fetch libcronet.dll
+        if: matrix.cgo == '0'
+        run: |
+          set -xeuo pipefail
+          LIB="lib/windows_${{ matrix.goarch }}/libcronet.dll"
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git "$RUNNER_TEMP/cronet-go-lib"
+          cd "$RUNNER_TEMP/cronet-go-lib"
+          git sparse-checkout set --no-cone "/$LIB"
+          git checkout "$CRONET_GO_VERSION"
+          cp "$LIB" "$GITHUB_WORKSPACE/dist/"
+          test -s "$GITHUB_WORKSPACE/dist/libcronet.dll"
+
+      - name: Package
+        run: |
+          set -xeuo pipefail
+          NAME="sing-box-${VERSION}-${{ matrix.name }}"
+          mkdir -p "pkg/${NAME}"
+          cp dist/* "pkg/${NAME}/"
+          git -C core rev-parse HEAD > "pkg/${NAME}/source-commit.txt"
+          if [ -f core/LICENSE ]; then cp core/LICENSE "pkg/${NAME}/"; fi
+          ls -l "pkg/${NAME}"
+          cd pkg
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "${NAME}.zip" "${NAME}"
+          else
+            tar -czvf "${NAME}.tar.gz" "${NAME}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-${{ matrix.name }}
+          path: |
+            pkg/*.zip
+            pkg/*.tar.gz
+          if-no-files-found: error
