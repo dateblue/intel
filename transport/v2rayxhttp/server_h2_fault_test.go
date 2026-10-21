@@ -24,8 +24,10 @@ import (
 func newXHTTP2TestServer(t *testing.T) (*Server, *http2.Transport, string) {
 	t.Helper()
 	s := &Server{path: "/xhttp/", method: http.MethodPost, padding: intRange{100, 100}, handler: &loadEchoHandler{}}
-	h2 := &http2.Server{MaxHeaderListSize: uint32(normalizeXHTTPHeaderBytes(0))}
-	ts := httptest.NewServer(h2c.NewHandler(s, h2))
+	h2 := &http2.Server{}
+	ts := httptest.NewUnstartedServer(h2c.NewHandler(s, h2))
+	ts.Config.MaxHeaderBytes = normalizeXHTTPHeaderBytes(0)
+	ts.Start()
 	t.Cleanup(ts.Close)
 	transport := &http2.Transport{
 		AllowHTTP: true,

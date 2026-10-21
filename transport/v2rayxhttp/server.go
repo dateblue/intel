@@ -89,11 +89,11 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 			slowWriteThreshold = time.Duration(ms) * time.Millisecond
 		}
 	}
-	// Match Xray's 8 KiB default for ordinary headers. The separate h2c
-	// server MUST receive its own limit; http.Server.MaxHeaderBytes alone
-	// does not reliably bound an HTTP/2 header list on this code path.
+	// HTTP/2 obtains its header-list limit from the enclosing http.Server's
+	// MaxHeaderBytes via h2c.ServeConnOpts.BaseConfig. http2.Server does not
+	// have a MaxHeaderListSize field (that field belongs to http2.Transport).
 	headerBytes := normalizeXHTTPHeaderBytes(options.ServerMaxHeaderBytes)
-	h2 := &http2.Server{MaxHeaderListSize: uint32(headerBytes)}
+	h2 := &http2.Server{}
 	var idleWarnThreshold time.Duration
 	if slowWriteThreshold > 0 {
 		if raw := os.Getenv("SING_BOX_XHTTP_IDLE_WARN_SEC"); raw != "" {
