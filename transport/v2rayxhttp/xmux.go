@@ -3,9 +3,13 @@ package v2rayxhttp
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/option"
@@ -144,10 +148,13 @@ var (
 // connection failing (evicted on the next pool lookup) and arms/extends the
 // manager's new-transport backoff. lx: SPEC 076.
 func (c *xmuxClient) noteFailure() {
-	if c.consecFails.Add(1) != xmuxBreakerThreshold {
+	if c.failing.Load() || c.consecFails.Add(1) != xmuxBreakerThreshold {
 		return
 	}
-	c.failing.Store(true)
+	// A terminal transport error may have retired the connection concurrently.
+	if c.failing.Swap(true) {
+		return
+	}
 	if c.manager != nil {
 		c.manager.noteBreakerTrip()
 	}
@@ -162,6 +169,38 @@ func (c *xmuxClient) noteSuccess() {
 	if c.manager != nil {
 		c.manager.resetBackoff()
 	}
+}
+
+// noteTerminalFailure retires a pool resource at the first compelling sign of
+// a dead TCP/HTTP2 connection, rather than waiting for three application-stream
+// failures. Existing active streams are NOT closed here; manager.get performs
+// the same deferred-retirement path as the ordinary circuit breaker.
+func (c *xmuxClient) noteTerminalFailure() {
+	if c.failing.Swap(true) {
+		return
+	}
+	if c.manager != nil {
+		c.manager.noteBreakerTrip()
+	}
+}
+
+// Do not mistake a locally cancelled stream or a clean EOF for an unhealthy
+// shared TCP connection. Timeout/closed/reset and unexpected transport EOF
+// are strong enough signals to choose a fresh connection for the next stream.
+func xhttpTerminalTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // roundTrip issues one HTTP request over this pooled connection, accounting it
@@ -184,7 +223,9 @@ func (c *xmuxClient) roundTrip(request *http.Request) (*http.Response, error) {
 	c.takeRequest()
 	response, err := c.conn.roundTripper().RoundTrip(request)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) {
+		if xhttpTerminalTransportError(err) {
+			c.noteTerminalFailure()
+		} else if !errors.Is(err, context.Canceled) {
 			c.noteFailure()
 		}
 	} else if response.StatusCode != http.StatusOK {
@@ -240,6 +281,15 @@ func (r *xmuxRelease) noteFailure() {
 		return
 	}
 	r.client.noteFailure()
+}
+
+// noteTerminalFailure marks a shared HTTP/2 connection unusable after a
+// transport-level failure observed while reading a response body.
+func (r *xmuxRelease) noteTerminalFailure() {
+	if r == nil || r.client == nil {
+		return
+	}
+	r.client.noteTerminalFailure()
 }
 
 // singleTransportXmux builds a manager permanently bound to one RoundTripper.

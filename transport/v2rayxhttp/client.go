@@ -180,10 +180,18 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		if len(tlsConfig.NextProtos()) == 0 {
 			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 		}
-		tlsDialer := tls.NewDialer(dialer, tlsConfig)
+		// These guards apply ONLY to the HTTP/2 XHTTP client. Neither TLS/REALITY
+		// handshakes nor the server's TCP Brutal congestion control are altered.
+		tlsDialer := tls.NewDialer(&xhttpGuardDialer{
+			Dialer:    dialer,
+			timeoutMS: xhttpTCPUserTimeoutMS(warn),
+			warn:      warn,
+		}, tlsConfig)
+		readIdle, pingTimeout := xhttpH2HealthTimers(xmuxConfig.keepAlivePeriod)
 		newConn = func() xmuxConn {
 			return &http2XmuxConn{transport: &http2.Transport{
-				ReadIdleTimeout: xmuxConfig.keepAlivePeriod,
+				ReadIdleTimeout: readIdle,
+				PingTimeout:     pingTimeout,
 				// Match Xray: reap only HTTP/2 TCP connections with no active streams.
 				// Never impose a timeout on active (including idle-data) streams.
 				IdleConnTimeout: 300 * time.Second,
