@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
@@ -183,6 +184,9 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		newConn = func() xmuxConn {
 			return &http2XmuxConn{transport: &http2.Transport{
 				ReadIdleTimeout: xmuxConfig.keepAlivePeriod,
+				// Match Xray: reap only HTTP/2 TCP connections with no active streams.
+				// Never impose a timeout on active (including idle-data) streams.
+				IdleConnTimeout: 300 * time.Second,
 				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.STDConfig) (net.Conn, error) {
 					return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
 				},

@@ -10,12 +10,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/tls"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
@@ -51,6 +51,9 @@ type Server struct {
 	h2cHandler http.Handler
 	// Diagnostics are opt-in. 0 means no per-frame timing overhead.
 	slowWriteThreshold time.Duration
+	// Only observed in opt-in diagnostics; no stream cap is imposed.
+	activeStreams     atomic.Int64
+	idleWarnThreshold time.Duration
 }
 
 func NewServer(ctx context.Context, logger logger.ContextLogger, options option.V2RayXHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
@@ -77,7 +80,6 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 	if err != nil {
 		return nil, err
 	}
-	h2 := &http2.Server{}
 	// Opt-in diagnostics for high-load stream-one stalls. Never tweak HTTP/2
 	// flow-control defaults as a side effect of enabling diagnostics.
 	var slowWriteThreshold time.Duration
@@ -87,14 +89,23 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 			slowWriteThreshold = time.Duration(ms) * time.Millisecond
 		}
 	}
-	headerBytes := options.ServerMaxHeaderBytes
-	if headerBytes <= 0 {
-		headerBytes = http.DefaultMaxHeaderBytes
+	// Match Xray's 8 KiB default for ordinary headers. The separate h2c
+	// server MUST receive its own limit; http.Server.MaxHeaderBytes alone
+	// does not reliably bound an HTTP/2 header list on this code path.
+	headerBytes := normalizeXHTTPHeaderBytes(options.ServerMaxHeaderBytes)
+	h2 := &http2.Server{MaxHeaderListSize: uint32(headerBytes)}
+	var idleWarnThreshold time.Duration
+	if slowWriteThreshold > 0 {
+		if raw := os.Getenv("SING_BOX_XHTTP_IDLE_WARN_SEC"); raw != "" {
+			if seconds, parseErr := strconv.Atoi(raw); parseErr == nil && seconds >= 10 && seconds <= 3600 {
+				idleWarnThreshold = time.Duration(seconds) * time.Second
+			}
+		}
 	}
-	s := &Server{tlsConfig: tlsConfig, handler: handler, logger: logger, path: path, method: method, host: options.Host, noSSE: options.NoSSEHeader, padding: padding, h2Server: h2, slowWriteThreshold: slowWriteThreshold}
+	s := &Server{tlsConfig: tlsConfig, handler: handler, logger: logger, path: path, method: method, host: options.Host, noSSE: options.NoSSEHeader, padding: padding, h2Server: h2, slowWriteThreshold: slowWriteThreshold, idleWarnThreshold: idleWarnThreshold}
 	s.httpServer = &http.Server{
 		Handler:           s,
-		ReadHeaderTimeout: C.TCPTimeout,
+		ReadHeaderTimeout: 4 * time.Second,
 		MaxHeaderBytes:    headerBytes,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ConnContext:       func(ctx context.Context, _ net.Conn) context.Context { return log.ContextWithNewID(ctx) },
@@ -159,27 +170,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 	}
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
 
-	// Only turn on transport timing when explicitly requested. These timings
-	// isolate stalls inside ResponseWriter.Write or Flush (HTTP/2 flow control)
-	// from waiting on the client request body or the VLESS outbound.
+	// Count active streams without imposing arbitrary concurrency caps. The
+	// watchdog and byte accounting are entirely disabled by default.
+	s.activeStreams.Add(1)
+	defer s.activeStreams.Add(-1)
+	reader := r.Body
 	if s.slowWriteThreshold > 0 && s.logger != nil {
+		var progress xhttpStreamProgress
+		reader = &xhttpCountingBody{ReadCloser: r.Body, progress: &progress}
 		wrapped := &xhttpSlowResponseWriter{
 			ResponseWriter: w,
 			flusher:        flusher,
 			threshold:      s.slowWriteThreshold,
+			progress:       &progress,
 			warn: func(op string, took time.Duration) {
-				s.logger.WarnContext(r.Context(), "xhttp stream-one slow ", op,
-					" elapsed=", took, " remote=", r.RemoteAddr)
+				s.logger.WarnContext(r.Context(), "xhttp stream-one ", op,
+					" elapsed=", took, " remote=", r.RemoteAddr,
+					" active_streams=", s.activeStreams.Load(),
+					" bytes_up=", progress.up.Load(), " bytes_down=", progress.down.Load(),
+					" context_err=", r.Context().Err())
 			},
 		}
+		// Keep observing until ServeHTTP actually returns, even if the
+		// connection has been cancelled: its cleanup may be blocked in
+		// CloseWrapper waiting for an in-flight HTTP/2 Write/Flush.
+		finished := make(chan struct{})
+		defer close(finished)
+		go wrapped.watch(finished, s.idleWarnThreshold)
 		w = wrapped
 		flusher = wrapped
 	}
+	// Keep the initial header Flush observable too: it can itself block when
+	// HTTP/2 is unable to progress before the first VLESS payload arrives.
+	flusher.Flush()
 	done := make(chan struct{})
 	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
-		HTTP2Conn: v2rayhttp.NewHTTPConn(r.Body, w),
+		HTTP2Conn: v2rayhttp.NewHTTPConn(reader, w),
 		Flusher:   flusher,
 	})
 	// The adapter's close callback signals the end of VLESS routing. An
@@ -225,29 +252,16 @@ func (s *Server) Serve(listener net.Listener) error {
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
 func (s *Server) Close() error                     { return common.Close(common.PtrOrNil(s.httpServer)) }
 
-// xhttpSlowResponseWriter wraps only the already-accepted response body.
-// It deliberately doesn't buffer, batch, or rewrite frames. Writes and Flush
-// retain their exact ordering. It is not a throughput optimization.
-type xhttpSlowResponseWriter struct {
-	http.ResponseWriter
-	flusher   http.Flusher
-	threshold time.Duration
-	warn      func(string, time.Duration)
-}
-
-func (w *xhttpSlowResponseWriter) Write(p []byte) (int, error) {
-	start := time.Now()
-	n, err := w.ResponseWriter.Write(p)
-	if elapsed := time.Since(start); elapsed >= w.threshold && w.warn != nil {
-		w.warn("Write", elapsed)
+// normalizeXHTTPHeaderBytes keeps an explicit user override but follows the
+// reference Xray 8192-byte default. Cap pathological overrides to avoid
+// allocating giant header buffers and keep cross-platform int conversion safe.
+func normalizeXHTTPHeaderBytes(configured int) int {
+	if configured <= 0 {
+		return 8192
 	}
-	return n, err
-}
-
-func (w *xhttpSlowResponseWriter) Flush() {
-	start := time.Now()
-	w.flusher.Flush()
-	if elapsed := time.Since(start); elapsed >= w.threshold && w.warn != nil {
-		w.warn("Flush", elapsed)
+	const maxHeaderBytes = 16 << 20
+	if configured > maxHeaderBytes {
+		return maxHeaderBytes
 	}
+	return configured
 }
