@@ -51,6 +51,7 @@ type xmuxConn interface {
 // is still running through it.
 type xmuxClient struct {
 	conn         xmuxConn
+	diagID       uint64       // v4.1 diagnostics only: stable pool resource ID
 	manager      *xmuxManager // breaker trips report here; never nil for pooled clients
 	openUsage    int          // streams currently alive on this connection
 	leftUsage    int          // handouts left before retirement; -1 = unlimited
@@ -148,7 +149,12 @@ var (
 // connection failing (evicted on the next pool lookup) and arms/extends the
 // manager's new-transport backoff. lx: SPEC 076.
 func (c *xmuxClient) noteFailure() {
-	if c.failing.Load() || c.consecFails.Add(1) != xmuxBreakerThreshold {
+	if c.failing.Load() {
+		return
+	}
+	failures := c.consecFails.Add(1)
+	c.diagEvent("failure", "consecutive=%d threshold=%d", failures, xmuxBreakerThreshold)
+	if failures != xmuxBreakerThreshold {
 		return
 	}
 	// A terminal transport error may have retired the connection concurrently.
@@ -165,7 +171,10 @@ func (c *xmuxClient) noteFailure() {
 // had 200-raises whose bodies died seconds later. Resets the failure streak
 // and disarms the manager backoff. lx: SPEC 076.
 func (c *xmuxClient) noteSuccess() {
-	c.consecFails.Store(0)
+	previous := c.consecFails.Swap(0)
+	if previous != 0 {
+		c.diagEvent("success-reset", "previous_failures=%d", previous)
+	}
 	if c.manager != nil {
 		c.manager.resetBackoff()
 	}
@@ -179,6 +188,7 @@ func (c *xmuxClient) noteTerminalFailure() {
 	if c.failing.Swap(true) {
 		return
 	}
+	c.diagEvent("terminal-failure", "consecutive=%d", c.consecFails.Load())
 	if c.manager != nil {
 		c.manager.noteBreakerTrip()
 	}
@@ -221,6 +231,7 @@ func xhttpTerminalTransportError(err error) bool {
 // connection is exactly the half-dead peer the breaker exists for.
 func (c *xmuxClient) roundTrip(request *http.Request) (*http.Response, error) {
 	c.takeRequest()
+	diagnostic := beginXmuxRoundTrip(c, request)
 	response, err := c.conn.roundTripper().RoundTrip(request)
 	if err != nil {
 		if xhttpTerminalTransportError(err) {
@@ -231,6 +242,7 @@ func (c *xmuxClient) roundTrip(request *http.Request) (*http.Response, error) {
 	} else if response.StatusCode != http.StatusOK {
 		c.noteFailure()
 	}
+	diagnostic.finish(response, err)
 	return response, err
 }
 
@@ -244,10 +256,11 @@ func (c *xmuxClient) roundTrip(request *http.Request) (*http.Response, error) {
 type xmuxRelease struct {
 	client *xmuxClient
 	once   sync.Once
+	diag   *xmuxStreamDiagnostic
 }
 
 func newXmuxRelease(client *xmuxClient) *xmuxRelease {
-	return &xmuxRelease{client: client}
+	return &xmuxRelease{client: client, diag: beginXmuxStream(client)}
 }
 
 func (r *xmuxRelease) release() {
@@ -255,6 +268,7 @@ func (r *xmuxRelease) release() {
 		return
 	}
 	r.once.Do(func() {
+		r.diag.finish()
 		r.client.addOpenUsage(-1)
 	})
 }
@@ -410,6 +424,7 @@ func (m *xmuxManager) Close() {
 func (m *xmuxManager) newClientLocked() *xmuxClient {
 	client := &xmuxClient{
 		conn:      m.newConn(),
+		diagID:    xmuxDiagPoolSeq.Add(1),
 		manager:   m,
 		leftUsage: -1,
 	}
@@ -426,6 +441,7 @@ func (m *xmuxManager) newClientLocked() *xmuxClient {
 	m.clients = append(m.clients, client)
 	m.logf("xmux: opened connection (pool=%d, left_usage=%d, left_requests=%d)",
 		len(m.clients), client.leftUsage, atomic.LoadInt32(&client.leftRequests))
+	m.logf("xmux: diag pool-open id=%d pool_size=%d", client.diagID, len(m.clients))
 	return client
 }
 
@@ -487,6 +503,7 @@ func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
 			m.clients = append(m.clients[:i], m.clients[i+1:]...)
 			evicted = append(evicted, client)
 			m.logf("xmux: evicted connection (cause=%s, pool=%d)", cause, len(m.clients))
+			m.logf("xmux: diag pool-evict id=%d cause=%s active=%d failures=%d", client.diagID, cause, client.getOpenUsage(), client.consecFails.Load())
 		} else {
 			i++
 		}

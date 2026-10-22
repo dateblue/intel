@@ -581,6 +581,7 @@ func (c *streamConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.reader.Read(b)
 	c.breaker.noteRead(err) // lx: SPEC 076
+	c.xmux.diagRead(n, err, c.breaker.localClosed.Load())
 	// A dead underlying HTTP/2/TCP connection may fail just this one stream.
 	// Retire its pooled resource before the NEXT stream is assigned, while
 	// preserving the normal read-error semantics for the current caller.
@@ -724,7 +725,8 @@ func (c *splitConn) Read(b []byte) (int, error) {
 		return 0, c.readerErr
 	}
 	n, err := c.reader.Read(b)
-	c.breaker.noteRead(err)                                                  // lx: SPEC 076
+	c.breaker.noteRead(err) // lx: SPEC 076
+	c.xmux.diagRead(n, err, c.breaker.localClosed.Load())
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline) // lx: SPEC 082, 094, 104 — after noteRead: the breaker classifies the raw error
 }
 func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
@@ -863,7 +865,8 @@ func (c *packetConn) Read(b []byte) (int, error) {
 		return 0, c.readerErr
 	}
 	n, err := c.reader.Read(b)
-	c.breaker.noteRead(err)                                                  // lx: SPEC 076
+	c.breaker.noteRead(err) // lx: SPEC 076
+	c.xmux.diagRead(n, err, c.breaker.localClosed.Load())
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline) // lx: SPEC 082, 094, 104 — after noteRead: the breaker classifies the raw error
 }
 
