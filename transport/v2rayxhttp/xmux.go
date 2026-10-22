@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -200,6 +201,12 @@ func (c *xmuxClient) noteTerminalFailure() {
 func xhttpTerminalTransportError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
 		return false
+	}
+	// A lost HTTP/2 ClientConn cannot serve future streams. X/net/http2 exposes
+	// this failure as an unexported error; classify its message as terminal.
+	// Ordinary per-stream closure and caller cancellations remain non-terminal.
+	if strings.Contains(err.Error(), "http2: client connection lost") {
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, net.ErrClosed) ||
