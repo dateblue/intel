@@ -187,6 +187,23 @@ jobs:
           fi
           echo "Android signing certificate SHA-256: $signing_sha256"
 
+          # SFA explicitly reads app/release.keystore and LOCAL_PROPERTIES.
+          # Provide the SAME persistent key already verified above. No new key.
+          install -m 600 "$KEYSTORE_FILE" app/release.keystore
+          export LOCAL_PROPERTIES="$(python3 - <<'PY_SIGNING_PROPERTIES'
+          import base64, os
+          
+          def escape_property(value):
+              return value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace(' ', '\\ ')
+          
+          props = (
+              'KEYSTORE_PASS=' + escape_property(os.environ['STORE_PASS']) + '\n'
+              'ALIAS_NAME=' + escape_property(os.environ['KEY_ALIAS']) + '\n'
+              'ALIAS_PASS=' + escape_property(os.environ['KEY_PASS']) + '\n'
+          )
+          print(base64.b64encode(props.encode()).decode())
+          PY_SIGNING_PROPERTIES
+          )"
           chmod +x ./gradlew
           ./gradlew :app:assembleOtherRelease \
             "-Pandroid.injected.signing.store.file=$KEYSTORE_FILE" \
@@ -201,20 +218,46 @@ jobs:
           APKSIGNER=$(find "$SDK_DIR/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
           test -x "$APKSIGNER" || { echo '::error::Android apksigner was not found.'; exit 1; }
 
+          # SIGNING-FINAL-20261024-R2: Re-sign the actual distributable APK
+          # with the persistent release key. This is intentionally independent
+          # of whether Gradle accepted android.injected.signing.* flags.
+          # apksigner removes prior signatures when signing an existing APK.
           shopt -s nullglob
           apks=(app/build/outputs/apk/other/release/*arm64-v8a*.apk)
           ((${#apks[@]} > 0)) || { echo '::error::No arm64 release APK to verify/upload.'; exit 1; }
           for apk in "${apks[@]}"; do
-            info=$("$APKSIGNER" verify --verbose --print-certs "$apk") || {
-              echo "::error::APK signature verification failed: $apk"; exit 1;
+            signed_apk="${apk%.apk}.signed.apk"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE_FILE" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:STORE_PASS \
+              --key-pass env:KEY_PASS \
+              --out "$signed_apk" "$apk"
+            info=$("$APKSIGNER" verify --verbose --print-certs "$signed_apk") || {
+              echo "::error::APK signature verification failed: $signed_apk"; exit 1;
             }
+            # apksigner versions differ: older "Signer #1 certificate ...",
+            # newer "V2 Signer: certificate ..." or "V3.0 Signer: ...".
+            # Read every certificate digest, requiring ONE consistent signer.
             apk_sha256=$(printf '%s\n' "$info" |
-              sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' |
-              head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')
-            if [ "$apk_sha256" != "$signing_sha256" ]; then
-              echo "::error::APK is signed with an unexpected certificate: $apk"
+              awk '/certificate SHA-256 digest:/ {
+                sub(/^.*certificate SHA-256 digest:[[:space:]]*/, "")
+                gsub(/[:[:space:]]/, "")
+                print tolower($0)
+              }' | sort -u)
+            if [[ ! "$apk_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not parse a unique APK signing certificate: $apk"
+              printf '%s\n' "$info" | grep -Ei 'signer|certificate SHA-256' || true
               exit 1
             fi
+            echo "Expected signing cert SHA-256: $signing_sha256"
+            echo "Actual APK signer cert SHA-256: $apk_sha256"
+            if [ "$apk_sha256" != "$signing_sha256" ]; then
+              echo "::error::APK uses a DIFFERENT signing certificate: $apk"
+              exit 1
+            fi
+            # Replace distributable only AFTER the new APK passed verification.
+            mv -f -- "$signed_apk" "$apk"
             echo "Verified signed APK: $apk (cert SHA-256: $apk_sha256)"
           done
 
