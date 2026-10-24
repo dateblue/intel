@@ -31,6 +31,7 @@ import (
 	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 
@@ -333,7 +334,12 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 	}
 	defer transport.CloseIdleConnections()
 
-	request, err := http.NewRequestWithContext(fallbackCtx, http.MethodGet, "https://"+serverName, nil)
+	serverAddress := M.ParseSocksaddrHostPort(serverName, 0)
+	host := serverAddress.AddrString()
+	if serverAddress.IsIPv6() {
+		host = "[" + host + "]"
+	}
+	request, err := http.NewRequestWithContext(fallbackCtx, http.MethodGet, "https://"+host, nil)
 	if err != nil {
 		return
 	}
