@@ -146,44 +146,77 @@ jobs:
             echo "$k : $(grep -a -c -i "$k" /tmp/aar/jni/arm64-v8a/libbox.so || true)"
           done
 
-      # 6. APK 签名：有 Secrets 时使用固定密钥；否则保持临时签名兼容旧流程。
-      # 首次启用固定密钥，可能无法覆盖安装之前使用随机临时密钥签署的 APK。
-      # GitHub Secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
-      #                 ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
-      - name: Sign and Build Release APK
+      # 6. 固定 Android Release 签名。严禁临时生成随机 keystore，避免每次 APK 签名变化。
+      # 仓库 Secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+      #                ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+      # 可选仓库 Variable: ANDROID_SIGNING_CERT_SHA256（固定预期证书 SHA-256，防误换签名）。
+      - name: Build and verify permanently signed Release APK
         env:
           KEY_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
         run: |
           set -euo pipefail
-          rm -f app/release.keystore
-          if [ -n "$KEY_B64" ]; then
-            : "${STORE_PASS:?ANDROID_KEYSTORE_PASSWORD is missing}"
-            : "${KEY_ALIAS:?ANDROID_KEY_ALIAS is missing}"
-            : "${KEY_PASS:?ANDROID_KEY_PASSWORD is missing}"
-            printf '%s' "$KEY_B64" | base64 -d > app/release.keystore
-            echo 'Using persistent Android signing key from repository secrets.'
-          else
-            echo '::warning::No Android signing secrets configured: this APK uses a new random signing key and cannot upgrade previous builds in place.'
-            STORE_PASS=android
-            KEY_ALIAS=androidreleasekey
-            KEY_PASS=android
-            keytool -genkeypair -v \
-              -keystore app/release.keystore \
-              -alias "$KEY_ALIAS" \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
-              -dname "CN=Android,OU=Android,O=Android,L=Unknown,ST=Unknown,C=US"
+
+          # 缺失任何 Secrets 就停止。绝不生成一次性签名，防止产出无法覆盖升级的 APK。
+          if [ -z "$KEY_B64" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+            echo '::error::Missing Android signing Secrets. Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD.'
+            exit 1
           fi
+
+          KEYSTORE_FILE="$RUNNER_TEMP/singbox-release.keystore"
+          trap 'rm -f "$KEYSTORE_FILE"' EXIT
+          (umask 077; printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE_FILE")
+          test -s "$KEYSTORE_FILE" || { echo '::error::Decoded keystore is empty.'; exit 1; }
+          keytool -list -keystore "$KEYSTORE_FILE" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" > /dev/null
+
+          # Keystore 中证书的 SHA-256 指纹（不是私钥，打印这个值是安全的）。
+          signing_sha256=$(keytool -exportcert -keystore "$KEYSTORE_FILE" \
+            -storepass "$STORE_PASS" -alias "$KEY_ALIAS" | openssl dgst -sha256 | awk '{print tolower($NF)}')
+          [[ "$signing_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Invalid keystore certificate fingerprint.'; exit 1; }
+
+          # 若设置了期望指纹，发现换签名立即失败，不允许生成不同证书的 APK。
+          if [ -n "$EXPECTED_CERT_SHA256" ]; then
+            pinned=$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+            if [ "$signing_sha256" != "$pinned" ]; then
+              echo '::error::Keystore certificate does not match ANDROID_SIGNING_CERT_SHA256.'
+              exit 1
+            fi
+          fi
+          echo "Android signing certificate SHA-256: $signing_sha256"
+
           chmod +x ./gradlew
           ./gradlew :app:assembleOtherRelease \
-            "-Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore" \
+            "-Pandroid.injected.signing.store.file=$KEYSTORE_FILE" \
             "-Pandroid.injected.signing.store.password=$STORE_PASS" \
             "-Pandroid.injected.signing.key.alias=$KEY_ALIAS" \
             "-Pandroid.injected.signing.key.password=$KEY_PASS" \
             --stacktrace
+
+          # 对实际上传的 arm64 APK 校验，而不是只相信 Gradle 参数。
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_DIR" || { echo '::error::ANDROID_HOME / ANDROID_SDK_ROOT is missing.'; exit 1; }
+          APKSIGNER=$(find "$SDK_DIR/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
+          test -x "$APKSIGNER" || { echo '::error::Android apksigner was not found.'; exit 1; }
+
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/other/release/*arm64-v8a*.apk)
+          ((${#apks[@]} > 0)) || { echo '::error::No arm64 release APK to verify/upload.'; exit 1; }
+          for apk in "${apks[@]}"; do
+            info=$("$APKSIGNER" verify --verbose --print-certs "$apk") || {
+              echo "::error::APK signature verification failed: $apk"; exit 1;
+            }
+            apk_sha256=$(printf '%s\n' "$info" |
+              sed -n 's/^Signer #1 certificate SHA-256 digest: *//p' |
+              head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+            if [ "$apk_sha256" != "$signing_sha256" ]; then
+              echo "::error::APK is signed with an unexpected certificate: $apk"
+              exit 1
+            fi
+            echo "Verified signed APK: $apk (cert SHA-256: $apk_sha256)"
+          done
 
       # 7. 上传 arm64-v8a 安装包
       - name: Upload APK Product
