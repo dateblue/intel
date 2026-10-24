@@ -170,7 +170,7 @@ func (c *xmuxClient) noteFailure() {
 		return
 	}
 	if c.manager != nil {
-		c.manager.noteBreakerTrip()
+		c.manager.noteBreakerTripFor(c)
 	}
 }
 
@@ -216,7 +216,7 @@ func (c *xmuxClient) noteTerminalError(err error) {
 	}
 	c.diagEvent("terminal-failure", "consecutive=%d hard_loss=%t", c.consecFails.Load(), xhttpDefinitiveTransportLoss(err))
 	if c.manager != nil {
-		c.manager.noteBreakerTrip()
+		c.manager.noteBreakerTripFor(c)
 	}
 }
 
@@ -399,9 +399,44 @@ type xmuxManager struct {
 	breakerEpoch uint64 // guarded by access; increments on every breaker trip
 }
 
-// noteBreakerTrip doubles the new-transport backoff window. lx: SPEC 076.
+// noteBreakerTripFor arms a global replacement backoff only while the
+// failing resource is STILL in the active pool. Rotated/expired resources may
+// have live HTTP/2 streams for hours; their eventual errors must not pause
+// fresh connections or poison the recovery generation of healthy successors.
+// Checking membership and updating the breaker must be one locked operation:
+// checking c.closed alone races with concurrent pool eviction.
+func (m *xmuxManager) noteBreakerTripFor(c *xmuxClient) {
+	m.access.Lock()
+	active := false
+	for _, candidate := range m.clients {
+		if candidate == c {
+			active = true
+			break
+		}
+	}
+	if !active {
+		m.access.Unlock()
+		c.diagEvent("retired-breaker-ignored", "failure_isolated=true")
+		return
+	}
+	m.armBreakerLocked()
+	delay := m.backoffDelay
+	m.access.Unlock()
+	m.logf("xmux: breaker tripped, new-transport backoff %s", delay)
+}
+
+// noteBreakerTrip remains for explicit manager operations and existing tests.
+// Production per-resource failures always use noteBreakerTripFor instead.
 func (m *xmuxManager) noteBreakerTrip() {
 	m.access.Lock()
+	m.armBreakerLocked()
+	delay := m.backoffDelay
+	m.access.Unlock()
+	m.logf("xmux: breaker tripped, new-transport backoff %s", delay)
+}
+
+// Caller must hold m.access.
+func (m *xmuxManager) armBreakerLocked() {
 	m.breakerEpoch++
 	if m.backoffDelay == 0 {
 		m.backoffDelay = xmuxBackoffInitial
@@ -410,9 +445,6 @@ func (m *xmuxManager) noteBreakerTrip() {
 	}
 	m.blockedUntil = timeNow().Add(m.backoffDelay)
 	m.backoffArmed.Store(true)
-	delay := m.backoffDelay
-	m.access.Unlock()
-	m.logf("xmux: breaker tripped, new-transport backoff %s", delay)
 }
 
 // Only a pool created in the current recovery generation can confirm that
