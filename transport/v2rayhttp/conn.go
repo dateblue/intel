@@ -223,14 +223,24 @@ func (c *HTTP2Conn) NeedAdditionalReadDeadline() bool {
 type ServerHTTPConn struct {
 	HTTP2Conn
 	Flusher http.Flusher
+	// Optional XHTTP v6 path: preserve HTTP/2 flush errors instead of
+	// discarding them through http.Flusher, which has no error return.
+	FlushError func() error
 }
 
 func (c *ServerHTTPConn) Write(b []byte) (n int, err error) {
 	n, err = c.writer.Write(b)
-	if err == nil {
+	if err != nil {
+		return n, err
+	}
+	if c.FlushError != nil {
+		if err = c.FlushError(); err != nil {
+			return n, baderror.WrapH2(err)
+		}
+	} else if c.Flusher != nil {
 		c.Flusher.Flush()
 	}
-	return
+	return n, nil
 }
 
 type HTTP2ConnWrapper struct {

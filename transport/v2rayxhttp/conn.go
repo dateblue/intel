@@ -586,7 +586,7 @@ func (c *streamConn) Read(b []byte) (int, error) {
 	// Retire its pooled resource before the NEXT stream is assigned, while
 	// preserving the normal read-error semantics for the current caller.
 	if !c.breaker.localClosed.Load() && !c.readDeadline.isExpired() && xhttpTerminalTransportError(err) {
-		c.xmux.noteTerminalFailure()
+		c.xmux.noteTerminalError(err)
 	}
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline)
 }
@@ -726,6 +726,9 @@ func (c *splitConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.reader.Read(b)
 	c.breaker.noteRead(err) // lx: SPEC 076
+	if !c.breaker.localClosed.Load() && !c.readDeadline.isExpired() && xhttpTerminalTransportError(err) {
+		c.xmux.noteTerminalError(err)
+	}
 	c.xmux.diagRead(n, err, c.breaker.localClosed.Load())
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline) // lx: SPEC 082, 094, 104 — after noteRead: the breaker classifies the raw error
 }
@@ -866,6 +869,9 @@ func (c *packetConn) Read(b []byte) (int, error) {
 	}
 	n, err := c.reader.Read(b)
 	c.breaker.noteRead(err) // lx: SPEC 076
+	if !c.breaker.localClosed.Load() && !c.readDeadline.isExpired() && xhttpTerminalTransportError(err) {
+		c.xmux.noteTerminalError(err)
+	}
 	c.xmux.diagRead(n, err, c.breaker.localClosed.Load())
 	return n, c.breaker.outboundErr(hideTransportError(err), c.readDeadline) // lx: SPEC 082, 094, 104 — after noteRead: the breaker classifies the raw error
 }

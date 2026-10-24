@@ -359,10 +359,20 @@ func (s *Server) serveDownload(w http.ResponseWriter, r *http.Request, upload io
 		w = wrapped
 		flush = wrapped
 	}
-	flush.Flush()
+	// Preserve the complete v5 server modes and session lifecycle while
+	// propagating HTTP/2 response Flush errors into the VLESS connection.
+	// ResponseController is supported by native and diagnostic writers.
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(r.Context(), "xhttp initial response flush failed: ", err)
+		}
+		return
+	}
 	done := make(chan struct{})
 	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
-		HTTP2Conn: v2rayhttp.NewHTTPConn(upload, w), Flusher: flush,
+		HTTP2Conn:  v2rayhttp.NewHTTPConn(upload, w),
+		Flusher:    flush,
+		FlushError: func() error { return http.NewResponseController(w).Flush() },
 	})
 	s.handler.NewConnectionEx(r.Context(), conn, badhttp.SourceAddress(r), M.Socksaddr{}, N.OnceClose(func(error) { close(done) }))
 	select {

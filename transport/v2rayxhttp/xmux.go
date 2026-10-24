@@ -54,6 +54,7 @@ type xmuxClient struct {
 	conn         xmuxConn
 	diagID       uint64       // v4.1 diagnostics only: stable pool resource ID
 	manager      *xmuxManager // breaker trips report here; never nil for pooled clients
+	openedEpoch  uint64       // recovery generation: old streams must not reset a newer breaker
 	openUsage    int          // streams currently alive on this connection
 	leftUsage    int          // handouts left before retirement; -1 = unlimited
 	leftRequests int32        // HTTP requests left before retirement (atomic)
@@ -115,6 +116,12 @@ func (c *xmuxClient) takeRequest() {
 type http2XmuxConn struct {
 	transport *http2.Transport
 	closed    atomic.Bool
+	// A logical XMUX resource may own multiple physical sockets. Keep their
+	// lifetimes explicit instead of assuming CloseIdleConnections tears down
+	// active HTTP/2 sessions (it does not).
+	socketMu sync.Mutex
+	sockets  map[*xmuxTrackedSocket]struct{}
+	fatal    atomic.Bool
 }
 
 func (c *http2XmuxConn) Close() {
@@ -172,12 +179,18 @@ func (c *xmuxClient) noteFailure() {
 // had 200-raises whose bodies died seconds later. Resets the failure streak
 // and disarms the manager backoff. lx: SPEC 076.
 func (c *xmuxClient) noteSuccess() {
+	// A late successful read on an already condemned pool must never disarm
+	// the recovery backoff for its replacement. High-load failures produce
+	// exactly this interleaving across unrelated HTTP/2 streams.
+	if c.failing.Load() {
+		return
+	}
 	previous := c.consecFails.Swap(0)
 	if previous != 0 {
 		c.diagEvent("success-reset", "previous_failures=%d", previous)
 	}
 	if c.manager != nil {
-		c.manager.resetBackoff()
+		c.manager.resetBackoffFor(c)
 	}
 }
 
@@ -186,10 +199,22 @@ func (c *xmuxClient) noteSuccess() {
 // failures. Existing active streams are NOT closed here; manager.get performs
 // the same deferred-retirement path as the ordinary circuit breaker.
 func (c *xmuxClient) noteTerminalFailure() {
+	c.noteTerminalError(nil)
+}
+
+// noteTerminalError distinguishes a confirmed dead physical connection from
+// a failure on one application stream. Only confirmed transport loss tears
+// down live sockets; ordinary failures still use deferred retirement.
+func (c *xmuxClient) noteTerminalError(err error) {
+	if xhttpDefinitiveTransportLoss(err) {
+		if transport, ok := c.conn.(*http2XmuxConn); ok {
+			transport.abortDead()
+		}
+	}
 	if c.failing.Swap(true) {
 		return
 	}
-	c.diagEvent("terminal-failure", "consecutive=%d", c.consecFails.Load())
+	c.diagEvent("terminal-failure", "consecutive=%d hard_loss=%t", c.consecFails.Load(), xhttpDefinitiveTransportLoss(err))
 	if c.manager != nil {
 		c.manager.noteBreakerTrip()
 	}
@@ -243,7 +268,7 @@ func (c *xmuxClient) roundTrip(request *http.Request) (*http.Response, error) {
 	response, err := c.conn.roundTripper().RoundTrip(request)
 	if err != nil {
 		if xhttpTerminalTransportError(err) {
-			c.noteTerminalFailure()
+			c.noteTerminalError(err)
 		} else if !errors.Is(err, context.Canceled) {
 			c.noteFailure()
 		}
@@ -308,10 +333,14 @@ func (r *xmuxRelease) noteFailure() {
 // noteTerminalFailure marks a shared HTTP/2 connection unusable after a
 // transport-level failure observed while reading a response body.
 func (r *xmuxRelease) noteTerminalFailure() {
+	r.noteTerminalError(nil)
+}
+
+func (r *xmuxRelease) noteTerminalError(err error) {
 	if r == nil || r.client == nil {
 		return
 	}
-	r.client.noteTerminalFailure()
+	r.client.noteTerminalError(err)
 }
 
 // singleTransportXmux builds a manager permanently bound to one RoundTripper.
@@ -367,11 +396,13 @@ type xmuxManager struct {
 	backoffDelay time.Duration
 	blockedUntil time.Time
 	backoffArmed atomic.Bool
+	breakerEpoch uint64 // guarded by access; increments on every breaker trip
 }
 
 // noteBreakerTrip doubles the new-transport backoff window. lx: SPEC 076.
 func (m *xmuxManager) noteBreakerTrip() {
 	m.access.Lock()
+	m.breakerEpoch++
 	if m.backoffDelay == 0 {
 		m.backoffDelay = xmuxBackoffInitial
 	} else if m.backoffDelay *= 2; m.backoffDelay > xmuxBackoffCap {
@@ -384,17 +415,39 @@ func (m *xmuxManager) noteBreakerTrip() {
 	m.logf("xmux: breaker tripped, new-transport backoff %s", delay)
 }
 
-// resetBackoff disarms the backoff window on genuine success. lx: SPEC 076.
+// Only a pool created in the current recovery generation can confirm that
+// reconnection succeeded. Old sockets may still deliver buffered bytes long
+// after a sibling failed; those reads must not cancel the new backoff window.
+func (m *xmuxManager) resetBackoffFor(c *xmuxClient) {
+	if !m.backoffArmed.Load() {
+		return
+	}
+	m.access.Lock()
+	if c.failing.Load() || c.openedEpoch < m.breakerEpoch {
+		m.access.Unlock()
+		return
+	}
+	m.resetBackoffLocked()
+	m.access.Unlock()
+	m.logf("xmux: breaker backoff reset (healthy replacement)")
+}
+
+// resetBackoff remains available for explicit manager shutdown/tests; normal
+// stream success must use resetBackoffFor instead.
 func (m *xmuxManager) resetBackoff() {
 	if !m.backoffArmed.Load() {
 		return
 	}
 	m.access.Lock()
+	m.resetBackoffLocked()
+	m.access.Unlock()
+	m.logf("xmux: breaker backoff reset")
+}
+
+func (m *xmuxManager) resetBackoffLocked() {
 	m.backoffDelay = 0
 	m.blockedUntil = time.Time{}
 	m.backoffArmed.Store(false)
-	m.access.Unlock()
-	m.logf("xmux: breaker backoff reset")
 }
 
 func newXmuxManager(config xmuxConfig, newConn func() xmuxConn) *xmuxManager {
@@ -431,10 +484,11 @@ func (m *xmuxManager) Close() {
 // Caller must hold m.access.
 func (m *xmuxManager) newClientLocked() *xmuxClient {
 	client := &xmuxClient{
-		conn:      m.newConn(),
-		diagID:    xmuxDiagPoolSeq.Add(1),
-		manager:   m,
-		leftUsage: -1,
+		conn:        m.newConn(),
+		diagID:      xmuxDiagPoolSeq.Add(1),
+		manager:     m,
+		openedEpoch: m.breakerEpoch,
+		leftUsage:   -1,
 	}
 	if x := m.config.cMaxReuseTimes.rand(); x > 0 {
 		client.leftUsage = x - 1
@@ -480,7 +534,10 @@ func (c *xmuxClient) evictCause() string {
 // healthy reuse stays untouched.
 func (m *xmuxManager) getContext(ctx context.Context) (*xmuxClient, error) {
 	for {
-		client, wait := m.get()
+		// Reserve while holding the manager lock. Otherwise parallel callers
+		// can all see openUsage=0 and exceed max_concurrency before DialContext
+		// performs its old, separate addOpenUsage(1).
+		client, wait := m.getReserved()
 		if client != nil {
 			return client, nil
 		}
@@ -501,6 +558,16 @@ func (m *xmuxManager) getContext(ctx context.Context) (*xmuxClient, error) {
 // returned client with addOpenUsage(-1) exactly once, via the release function
 // returned by Client.acquireXmux.
 func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
+	return m.getInternal(false)
+}
+
+func (m *xmuxManager) getReserved() (*xmuxClient, time.Duration) {
+	return m.getInternal(true)
+}
+
+// getInternal preserves the original unreserved get() for existing internal
+// tests and reserves atomically for production getContext() callers.
+func (m *xmuxManager) getInternal(reserve bool) (*xmuxClient, time.Duration) {
 	m.access.Lock()
 	defer m.access.Unlock()
 
@@ -533,10 +600,10 @@ func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
 				return nil, wait
 			}
 		}
-		return m.newClientLocked(), 0
+		return m.prepareHandout(m.newClientLocked(), reserve), 0
 	}
 	if m.connections > 0 && len(m.clients) < m.connections {
-		return m.newClientLocked(), 0
+		return m.prepareHandout(m.newClientLocked(), reserve), 0
 	}
 
 	// Prefer a connection with no outstanding failure streak. One transport
@@ -556,24 +623,37 @@ func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
 	var healthy, suspect *xmuxClient
 	var healthyCount, suspectCount int
 	minFailures := int32(maxInt32)
+	minHealthyUsage, minSuspectUsage := int(^uint(0)>>1), int(^uint(0)>>1)
 	for _, candidate := range m.clients {
-		if m.concurrency > 0 && candidate.getOpenUsage() >= m.concurrency {
+		usage := candidate.getOpenUsage()
+		if m.concurrency > 0 && usage >= m.concurrency {
 			continue
 		}
 		failures := candidate.consecFails.Load()
 		if failures == 0 {
-			healthyCount++
-			if randIntn(healthyCount) == 0 {
-				healthy = candidate
+			// Least-loaded healthy resource reduces the chance that a new
+			// interactive flow lands on the same H2 connection as a speed test.
+			if usage < minHealthyUsage {
+				minHealthyUsage, healthyCount = usage, 0
+			}
+			if usage == minHealthyUsage {
+				healthyCount++
+				if randIntn(healthyCount) == 0 {
+					healthy = candidate
+				}
 			}
 		} else if failures <= minFailures {
 			if failures < minFailures {
-				minFailures = failures
-				suspectCount = 0
+				minFailures, minSuspectUsage, suspectCount = failures, usage, 0
 			}
-			suspectCount++
-			if randIntn(suspectCount) == 0 {
-				suspect = candidate
+			if usage < minSuspectUsage {
+				minSuspectUsage, suspectCount = usage, 0
+			}
+			if usage == minSuspectUsage {
+				suspectCount++
+				if randIntn(suspectCount) == 0 {
+					suspect = candidate
+				}
 			}
 		}
 	}
@@ -582,12 +662,21 @@ func (m *xmuxManager) get() (*xmuxClient, time.Duration) {
 		client = suspect
 	}
 	if client == nil {
-		return m.newClientLocked(), 0
+		return m.prepareHandout(m.newClientLocked(), reserve), 0
 	}
 	if client.leftUsage > 0 {
 		client.leftUsage--
 	}
-	return client, 0
+	return m.prepareHandout(client, reserve), 0
+}
+
+// Manager lock must be held. The new stream's slot is visible to all other
+// callers before getInternal returns, closing the concurrent acquisition race.
+func (m *xmuxManager) prepareHandout(client *xmuxClient, reserve bool) *xmuxClient {
+	if reserve {
+		client.addOpenUsage(1)
+	}
+	return client
 }
 
 const maxInt32 = int32(^uint32(0) >> 1)

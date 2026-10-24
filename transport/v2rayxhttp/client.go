@@ -189,16 +189,22 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		}, tlsConfig)
 		readIdle, pingTimeout := xhttpH2HealthTimers(xmuxConfig.keepAlivePeriod)
 		newConn = func() xmuxConn {
-			return &http2XmuxConn{transport: &http2.Transport{
+			pool := &http2XmuxConn{sockets: make(map[*xmuxTrackedSocket]struct{})}
+			pool.transport = &http2.Transport{
 				ReadIdleTimeout: readIdle,
 				PingTimeout:     pingTimeout,
 				// Match Xray: reap only HTTP/2 TCP connections with no active streams.
 				// Never impose a timeout on active (including idle-data) streams.
 				IdleConnTimeout: 300 * time.Second,
 				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.STDConfig) (net.Conn, error) {
-					return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
+					conn, err := tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
+					if err != nil {
+						return nil, err
+					}
+					return pool.trackSocket(conn)
 				},
-			}}
+			}
+			return pool
 		}
 	}
 	if logger != nil {
@@ -274,7 +280,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	xmuxClient.addOpenUsage(1)
+	// getContext already reserved a slot atomically under the manager lock.
 	// lx: SPEC 077 — one release handle for the whole dial. The conn's Close and
 	// fail share it with this error path, so a raise that fails INSIDE the dial
 	// (fail already released the slot before the error surfaced here) cannot

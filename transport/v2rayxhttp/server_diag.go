@@ -93,10 +93,21 @@ func (w *xhttpSlowResponseWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (w *xhttpSlowResponseWriter) Flush() {
+// FlushError lets http.ResponseController observe failures without bypassing
+// our optional timing diagnostics. Unwrap is used for ordinary capabilities.
+func (w *xhttpSlowResponseWriter) FlushError() error {
 	w.begin("Flush")
-	w.flusher.Flush()
+	err := http.NewResponseController(w.ResponseWriter).Flush()
 	w.end()
+	return err
+}
+
+func (w *xhttpSlowResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *xhttpSlowResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // watch reports a blocked HTTP/2 Write/Flush *while it is still blocked*,
