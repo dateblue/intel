@@ -12,11 +12,11 @@ import (
 
 // The kernel's default TCP retransmission window may last minutes.  XHTTP
 // stream-one multiplexes many application streams over a single long-lived TCP
-// socket, so an unacknowledged *dead* connection can stall all those streams.
-// TCP_USER_TIMEOUT only limits time with unacknowledged TCP data; it is not an
-// inactivity timeout, and therefore does not close a healthy idle socket.
+// socket. An aggressive TCP_USER_TIMEOUT can turn a transient high-load stall
+// into ETIMEDOUT, killing all streams sharing that socket. Leave the kernel
+// default unchanged unless the operator explicitly opts in via the env var.
 // The setting is deliberately scoped to XHTTP HTTP/2 client TCP dials only.
-const defaultXHTTPTCPUserTimeoutMS = 15000
+const defaultXHTTPTCPUserTimeoutMS = 0
 
 func xhttpTCPUserTimeoutMS(warn func(string)) int {
 	raw, present := os.LookupEnv("SING_BOX_XHTTP_TCP_USER_TIMEOUT_MS")
@@ -28,7 +28,7 @@ func xhttpTCPUserTimeoutMS(warn func(string)) int {
 		return value
 	}
 	if warn != nil {
-		warn("invalid SING_BOX_XHTTP_TCP_USER_TIMEOUT_MS; using 15000 (0 disables)")
+		warn("invalid SING_BOX_XHTTP_TCP_USER_TIMEOUT_MS; using kernel default (0)")
 	}
 	return defaultXHTTPTCPUserTimeoutMS
 }

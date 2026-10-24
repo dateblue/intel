@@ -21,6 +21,8 @@ func TestXHTTPV42ClientConnectionLostClassification(t *testing.T) {
 	}{
 		{"h2 client connection lost", errors.New("http2: client connection lost"), true},
 		{"wrapped h2 connection lost", fmt.Errorf("proxy request: %w", errors.New("http2: client connection lost")), true},
+		{"h2 client conn is closed", errors.New("http2: client conn is closed"), true},
+		{"wrapped h2 client conn is closed", fmt.Errorf("read failed: %w", errors.New("http2: client conn is closed")), true},
 		{"h2 body locally closed", errors.New("http2: response body closed"), false},
 		{"h2 stream closed", errors.New("http2: stream closed"), false},
 		{"h2 stream reset", errors.New("stream error: stream ID 1; CANCEL"), false},
@@ -46,7 +48,7 @@ func TestXHTTPV42LostConnectionIsolatedRetirement(t *testing.T) {
 		idx := len(transports)
 		rt := &failingRT{}
 		if idx == 0 {
-			rt.errs = []error{errors.New("http2: client connection lost")}
+			rt.errs = []error{errors.New("http2: client conn is closed")}
 		} else {
 			rt.statuses = []int{http.StatusOK}
 		}

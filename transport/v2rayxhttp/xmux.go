@@ -205,7 +205,8 @@ func xhttpTerminalTransportError(err error) bool {
 	// A lost HTTP/2 ClientConn cannot serve future streams. X/net/http2 exposes
 	// this failure as an unexported error; classify its message as terminal.
 	// Ordinary per-stream closure and caller cancellations remain non-terminal.
-	if strings.Contains(err.Error(), "http2: client connection lost") {
+	if strings.Contains(err.Error(), "http2: client connection lost") ||
+		strings.Contains(err.Error(), "http2: client conn is closed") {
 		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) ||

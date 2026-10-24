@@ -8,8 +8,8 @@ import "time"
 // In particular, keepAlivePeriod=0 is the *normal* default from normalizeXmux,
 // not an explicit request to disable the HTTP/2 health check.
 const (
-	defaultXHTTPH2ReadIdle    = 15 * time.Second
-	defaultXHTTPH2PingTimeout = 7 * time.Second
+	defaultXHTTPH2ReadIdle    = 45 * time.Second
+	defaultXHTTPH2PingTimeout = 15 * time.Second
 )
 
 func xhttpH2HealthTimers(keepAlivePeriod time.Duration) (readIdle, pingTimeout time.Duration) {

@@ -10,8 +10,8 @@ func TestXHTTPH2HealthTimers(t *testing.T) {
 		name                      string
 		input, wantIdle, wantPing time.Duration
 	}{
-		{"defaults", 0, 15 * time.Second, 7 * time.Second},
-		{"explicit", 25 * time.Second, 25 * time.Second, 7 * time.Second},
+		{"defaults", 0, 45 * time.Second, 15 * time.Second},
+		{"explicit", 25 * time.Second, 25 * time.Second, 15 * time.Second},
 		{"disabled", -time.Second, 0, 0},
 	}
 	for _, tc := range tests {
@@ -21,6 +21,13 @@ func TestXHTTPH2HealthTimers(t *testing.T) {
 				t.Fatalf("got (%s, %s), want (%s, %s)", idle, ping, tc.wantIdle, tc.wantPing)
 			}
 		})
+	}
+}
+
+func TestXHTTPTCPUserTimeoutDefaultDisabled(t *testing.T) {
+	t.Setenv("SING_BOX_XHTTP_TCP_USER_TIMEOUT_MS", "")
+	if got := xhttpTCPUserTimeoutMS(nil); got != 0 {
+		t.Fatalf("default TCP_USER_TIMEOUT=%d, want system default 0", got)
 	}
 }
 
