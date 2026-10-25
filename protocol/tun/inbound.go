@@ -37,33 +37,34 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 type Inbound struct {
-	tag                     string
-	ctx                     context.Context
-	router                  adapter.Router
-	networkManager          adapter.NetworkManager
-	logger                  log.ContextLogger
-	tunOptions              tun.Options
-	udpTimeout              time.Duration
-	udpMapping              tun.NATMapping
-	udpFiltering            tun.NATFiltering
-	udpNATMax               uint32
-	dnsHijackAddress        []netip.Addr
-	dnsHijackByPort         bool
-	stack                   string
-	tunIf                   tun.Tun
-	tunStack                tun.Stack
-	platformInterface       adapter.PlatformInterface
-	usePlatformInterface    bool
-	platformOptions         option.TunPlatformOptions
-	enableAutoRedirect      bool
-	usePlatformAutoRedirect bool
-	disableNFTables         bool
-	autoRedirect            tun.AutoRedirect
-	routeRuleSet            []adapter.RuleSet
-	routeExcludeRuleSet     []adapter.RuleSet
-	routeAddressSetAccess   sync.RWMutex
-	routeAddressSet         []*netipx.IPSet
-	routeExcludeAddressSet  []*netipx.IPSet
+	tag                      string
+	sniffOverrideDestination bool
+	ctx                      context.Context
+	router                   adapter.Router
+	networkManager           adapter.NetworkManager
+	logger                   log.ContextLogger
+	tunOptions               tun.Options
+	udpTimeout               time.Duration
+	udpMapping               tun.NATMapping
+	udpFiltering             tun.NATFiltering
+	udpNATMax                uint32
+	dnsHijackAddress         []netip.Addr
+	dnsHijackByPort          bool
+	stack                    string
+	tunIf                    tun.Tun
+	tunStack                 tun.Stack
+	platformInterface        adapter.PlatformInterface
+	usePlatformInterface     bool
+	platformOptions          option.TunPlatformOptions
+	enableAutoRedirect       bool
+	usePlatformAutoRedirect  bool
+	disableNFTables          bool
+	autoRedirect             tun.AutoRedirect
+	routeRuleSet             []adapter.RuleSet
+	routeExcludeRuleSet      []adapter.RuleSet
+	routeAddressSetAccess    sync.RWMutex
+	routeAddressSet          []*netipx.IPSet
+	routeExcludeAddressSet   []*netipx.IPSet
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -199,11 +200,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	inbound := &Inbound{
-		tag:            tag,
-		ctx:            ctx,
-		router:         router,
-		networkManager: networkManager,
-		logger:         logger,
+		tag:                      tag,
+		ctx:                      ctx,
+		router:                   router,
+		sniffOverrideDestination: options.SniffOverrideDestination,
+		networkManager:           networkManager,
+		logger:                   logger,
 		tunOptions: tun.Options{
 			Name:                                  options.InterfaceName,
 			NetNs:                                 options.NetNs,
@@ -615,7 +617,8 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 		}
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
-	return adapter.JudgeFlow(t.router, adapter.InboundContext{Inbound: t.tag, InboundType: C.TypeTun}, network, source, destination, firstPacket)
+	return adapter.JudgeFlow(t.router, adapter.InboundContext{Inbound: t.tag, InboundType: C.TypeTun,
+		SniffOverrideDestination: t.sniffOverrideDestination}, network, source, destination, firstPacket)
 }
 
 func (t *Inbound) isDNSHijackDestination(destination M.Socksaddr) bool {
@@ -640,6 +643,7 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
+	metadata.SniffOverrideDestination = t.sniffOverrideDestination
 	metadata.Source = source
 	metadata.Destination = destination
 	if t.isDNSHijackDestination(destination) {
@@ -659,6 +663,7 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
+	metadata.SniffOverrideDestination = t.sniffOverrideDestination
 	metadata.Source = source
 	metadata.Destination = destination
 	if t.isDNSHijackDestination(destination) {
@@ -684,6 +689,7 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
+	metadata.SniffOverrideDestination = t.sniffOverrideDestination
 	metadata.Source = source
 	metadata.Destination = destination
 	if (*Inbound)(t).isDNSHijackDestination(destination) {

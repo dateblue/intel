@@ -366,6 +366,7 @@ func init() {
 	randomizedFingerprint = utls.HelloRandomized
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
+	lxRandomFingerprints() // PQC: ensure hybrid key share in random fingerprints
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {

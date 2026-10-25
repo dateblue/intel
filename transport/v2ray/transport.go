@@ -62,6 +62,8 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 		return NewQUICClient(ctx, dialer, serverAddr, options.QUICOptions, tlsConfig)
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
+	case C.V2RayTransportTypeXHTTP:
+		return newXHTTPClient(ctx, dialer, serverAddr, options.XHTTPOptions, tlsConfig)
 	default:
 		return nil, E.New("unknown transport type: " + options.Type)
 	}

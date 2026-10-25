@@ -1,0 +1,575 @@
+name: Build sing-box (SOCKS + XHTTP/Reality/Naive client + HY2/TUIC)
+
+# Install as .github/workflows/build-xhttp.yml on pqc-new.
+# The tracked core source stays official alpha13 + three feature patches.
+# At build time, the workflow creates a temporary minimal registry profile:
+# inbound: TUN, Redirect, TProxy, Direct, SOCKS, Hysteria2, TUIC v5
+# outbound: Direct, Bridge, Block, Selector, URLTest, SOCKS, VLESS/REALITY/XHTTP, Naive, Hysteria2, TUIC v5
+# The VLESS, Naive, and unrelated proxy inbounds are not registered.
+# DNS transports / Clash API / packaging / persistent Android signing remain unchanged.
+# 产物:
+#   1. sing-box-arm64-v8a-naive-release-apk   Android arm64 APK (带 naive + xhttp)
+#   2. sing-box-windows-amd64                 sing-box.exe + libcronet.dll (purego)
+#   3. sing-box-linux-amd64-musl              CGO + musl, 适合 OpenWrt/ImmortalWrt x86
+#   4. sing-box-linux-arm64-musl              CGO + musl (static)
+
+on:
+  push:
+    branches:
+      - pqc-new
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'dateblue/intel 的分支或 tag (留空 = pqc-new)'
+        required: false
+        default: ''
+        type: string
+      version:
+        description: '写入二进制的版本号'
+        required: false
+        default: '1.15.0-custom-naive-xhttp'
+        type: string
+
+env:
+  CORE_REPO: https://github.com/dateblue/intel.git
+  CORE_REF: ${{ inputs.core_ref || 'pqc-new' }}
+  VERSION: ${{ inputs.version || '1.15.0-custom-naive-xhttp' }}
+# 保留 QUIC(DNS/HY2/TUIC)、uTLS(REALITY/PQC)、Clash API、Naive 出站、XHTTP 客户端。
+  # with_naive 在这份源码中并非 Naive 的有效编译开关；with_naive_outbound 才是。
+  # 不启用 with_dhcp：用户使用独立路由器 DHCP/RA，且不需要 DHCP DNS。
+  BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,with_xhttp,badlinkname,tfogo_checklinkname0
+
+jobs:
+  # ------------------------------------------------------------------
+  # A. Android APK (arm64, 保留 naive + xhttp)
+  # ------------------------------------------------------------------
+  apk:
+    name: Android APK (arm64, naive, xhttp)
+    runs-on: ubuntu-24.04
+
+    steps:
+      # 1. 拉取 Android 客户端外壳 (SFA)
+      - name: Checkout sing-box-for-android
+        uses: actions/checkout@v7
+        with:
+          repository: 'SagerNet/sing-box-for-android'
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # 2. 将官方 sing-box 核心替换为自定义的 dateblue/intel 代码
+      - name: Replace core with custom dateblue/intel
+        run: |
+          rm -rf sing-box
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" sing-box
+          else
+            git clone --depth 1 "$CORE_REPO" sing-box
+          fi
+          echo "Android core SHA: $(git -C sing-box rev-parse HEAD)"
+          test -f sing-box/include/registry.go
+          test -f sing-box/include/quic.go
+          test -f sing-box/transport/v2ray/client_xhttp_enabled.go
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+          cache-dependency-path: sing-box/go.sum
+
+      - &client_profile
+        name: Apply build-only client/server protocol profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PROTOCOL_PROFILE'
+          from pathlib import Path
+          import re
+          
+          # Build-only profile: do not modify the tracked upstream alpha13 source.
+          roots = [p for p in (Path('sing-box'), Path('core')) if (p / 'include/registry.go').is_file()]
+          if len(roots) != 1:
+              raise SystemExit(f'Expected exactly one core checkout, found: {roots}')
+          root = roots[0]
+          
+          registry = root / 'include/registry.go'
+          quic = root / 'include/quic.go'
+          
+          # Keep TUN/Redirect/TProxy/direct and SOCKS inbounds; HY2/TUIC are in quic.go.
+          # Keep infrastructure outbounds plus SOCKS, VLESS (Reality + XHTTP) and Naive.
+          remove_registry = [
+              'http.RegisterInbound(registry)',
+              'mixed.RegisterInbound(registry)',
+              'shadowsocks.RegisterInbound(registry)',
+              'snell.RegisterInbound(registry)',
+              'vmess.RegisterInbound(registry)',
+              'trojan.RegisterInbound(registry)',
+              'naive.RegisterInbound(registry)',
+              'shadowtls.RegisterInbound(registry)',
+              'vless.RegisterInbound(registry)',
+              'anytls.RegisterInbound(registry)',
+              'registerCloudflaredInbound(registry)',
+              'registerTailcatInbound(registry)',
+              'registerStubForRemovedInbounds(registry)',
+              'http.RegisterOutbound(registry)',
+              'shadowsocks.RegisterOutbound(registry)',
+              'snell.RegisterOutbound(registry)',
+              'vmess.RegisterOutbound(registry)',
+              'trojan.RegisterOutbound(registry)',
+              'tor.RegisterOutbound(registry)',
+              'ssh.RegisterOutbound(registry)',
+              'shadowtls.RegisterOutbound(registry)',
+              'anytls.RegisterOutbound(registry)',
+              'registerTailcatOutbound(registry)',
+              'registerStubForRemovedOutbounds(registry)',
+              'registerWireGuardEndpoint(registry)',
+              'registerOpenConnectEndpoint(registry)',
+              'registerOpenVPNEndpoints(registry)',
+              'masque.RegisterEndpoint(registry)',
+              'registerTailscaleEndpoint(registry)',
+          ]
+          remove_quic = [
+              'hysteria.RegisterInbound(registry)',
+              'hysteria.RegisterOutbound(registry)',
+          ]
+          
+          
+          def drop_exact_lines(source, targets, label):
+              output = []
+              counts = {target: 0 for target in targets}
+              for line in source.splitlines(keepends=True):
+                  stripped = line.strip()
+                  if stripped in counts:
+                      counts[stripped] += 1
+                  else:
+                      output.append(line)
+              unexpected = {k: v for k, v in counts.items() if v != 1}
+              if unexpected:
+                  raise SystemExit(f'{label}: unexpected upstream layout, refusing to build: {unexpected}')
+              return ''.join(output)
+          
+          
+          def prune_imports(source, allowed_protocols):
+              lines = []
+              for line in source.splitlines(keepends=True):
+                  match = re.match(r'^\s*(?:_\s+)?"github\.com/sagernet/sing-box/protocol/([^"/]+)(?:/[^\"]+)?"', line)
+                  if match and match.group(1) not in allowed_protocols:
+                      continue
+                  if '"github.com/sagernet/sing-box/transport/v2rayquic"' in line:
+                      # No V2Ray-QUIC transport in the requested client-only protocol set.
+                      continue
+                  lines.append(line)
+              return ''.join(lines)
+          
+          registry_text = registry.read_text(encoding='utf-8')
+          registry_text = drop_exact_lines(registry_text, remove_registry, 'include/registry.go')
+          registry_text = prune_imports(registry_text, {'block', 'bridge', 'direct', 'group', 'redirect', 'socks', 'tun', 'vless'})
+          quic_text = quic.read_text(encoding='utf-8')
+          quic_text = drop_exact_lines(quic_text, remove_quic, 'include/quic.go')
+          quic_text = prune_imports(quic_text, {'hysteria2', 'tuic'})
+          
+          # Avoid silently building a different protocol profile if upstream changes.
+          registry_required = [
+              'tun.RegisterInbound(registry)',
+              'redirect.RegisterRedirect(registry)',
+              'redirect.RegisterTProxy(registry)',
+              'direct.RegisterInbound(registry)',
+              'socks.RegisterInbound(registry)',
+              'socks.RegisterOutbound(registry)',
+              'vless.RegisterOutbound(registry)',
+              'registerNaiveOutbound(registry)',
+              'registerQUICInbounds(registry)',
+              'registerQUICOutbounds(registry)',
+          ]
+          quic_required = [
+              'hysteria2.RegisterInbound(registry)',
+              'hysteria2.RegisterOutbound(registry)',
+              'tuic.RegisterInbound(registry)',
+              'tuic.RegisterOutbound(registry)',
+          ]
+          for entry in registry_required:
+              if registry_text.count(entry) != 1:
+                  raise SystemExit(f'Expected one registry entry: {entry}')
+          for entry in quic_required:
+              if quic_text.count(entry) != 1:
+                  raise SystemExit(f'Expected one QUIC entry: {entry}')
+          for forbidden in remove_registry:
+              if re.search(r'^\s*' + re.escape(forbidden) + r'\s*$', registry_text, re.M):
+                  raise SystemExit(f'Forbidden registry entry survived: {forbidden}')
+          for forbidden in remove_quic:
+              if re.search(r'^\s*' + re.escape(forbidden) + r'\s*$', quic_text, re.M):
+                  raise SystemExit(f'Forbidden QUIC entry survived: {forbidden}')
+          
+          registry.write_text(registry_text, encoding='utf-8', newline='')
+          quic.write_text(quic_text, encoding='utf-8', newline='')
+          print(f'Client/server profile applied to {root}: socks=in+out, vless=out, naive=out, hy2/tuic=in+out')
+          PY_PROTOCOL_PROFILE
+          if [ -d sing-box/include ]; then CORE_DIR=sing-box; else CORE_DIR=core; fi
+          gofmt -w "$CORE_DIR/include/registry.go" "$CORE_DIR/include/quic.go"
+
+      # Gradle 打包仍使用原来的 NDK 25
+      - name: Setup Android SDK & NDK 25
+        id: setup-android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      # naive (cronet) 的 cgo 链接用 NDK r28, 与上游 release 一致
+      - name: Setup Android NDK r28 (for libbox)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      # 3. 精简 libbox 构建标签：去掉 wireguard / usbip / openvpn / openconnect / tailscale
+      #    保留 quic / utls / clash_api / naive_outbound / xhttp
+      - name: Slim libbox build tags (keep naive & xhttp)
+        run: |
+          F=sing-box/cmd/internal/build_libbox/main.go
+          sed -i 's/"with_wireguard", //; s/"with_usbip", //; s/"with_openvpn", //; s/"with_openconnect", //' "$F"
+          sed -i '/sharedTags = append(sharedTags, "with_tailscale"/d' "$F"
+          echo "---- sharedTags lines after patch ----"
+          grep -n 'sharedTags = append' "$F"
+          if grep 'sharedTags = append' "$F" | grep -qE 'with_(wireguard|usbip|openvpn|openconnect|tailscale)'; then
+            echo "slimming failed: heavy tags still present"; exit 1
+          fi
+          if ! grep 'sharedTags = append' "$F" | grep -q 'with_naive_outbound'; then
+            echo "with_naive_outbound missing from sharedTags"; exit 1
+          fi
+          # 【改动 2】检查并确保 Android libbox 标签中包含 with_xhttp
+          if ! grep 'sharedTags = append' "$F" | grep -q 'with_xhttp'; then
+            echo "with_xhttp missing from sharedTags, appending..."
+            sed -i '/sharedTags = append(sharedTags/s/)/, "with_xhttp")/' "$F"
+          fi
+
+      # 4. 编译核心 (仅 arm64)
+      - name: Build Libbox Core (arm64, naive, xhttp)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          cd sing-box
+          go run ./cmd/internal/build_libbox -target android -platform android/arm64
+          mkdir -p ../app/libs
+          cp libbox.aar ../app/libs/libbox.aar
+
+      # 5. 检查 libbox.so 体积; cronet-go 应当存在 (说明 naive 已编入)
+      - name: Inspect libbox
+        run: |
+          rm -rf /tmp/aar && mkdir -p /tmp/aar
+          unzip -o app/libs/libbox.aar 'jni/arm64-v8a/libbox.so' -d /tmp/aar
+          ls -l /tmp/aar/jni/arm64-v8a/libbox.so
+          for k in 'tailscale.com/' 'golang.zx2c4.com/wireguard' 'cronet-go'; do
+            echo "$k : $(grep -a -c -i "$k" /tmp/aar/jni/arm64-v8a/libbox.so || true)"
+          done
+
+      # 6. 固定 Android Release 签名。严禁临时生成随机 keystore，避免每次 APK 签名变化。
+      # 仓库 Secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+      #                ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+      # 可选仓库 Variable: ANDROID_SIGNING_CERT_SHA256（固定预期证书 SHA-256，防误换签名）。
+      - name: Build and verify permanently signed Release APK
+        env:
+          KEY_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+
+          # 缺失任何 Secrets 就停止。绝不生成一次性签名，防止产出无法覆盖升级的 APK。
+          if [ -z "$KEY_B64" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+            echo '::error::Missing Android signing Secrets. Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD.'
+            exit 1
+          fi
+
+          KEYSTORE_FILE="$RUNNER_TEMP/singbox-release.keystore"
+          trap 'rm -f "$KEYSTORE_FILE"' EXIT
+          (umask 077; printf '%s' "$KEY_B64" | base64 --decode > "$KEYSTORE_FILE")
+          test -s "$KEYSTORE_FILE" || { echo '::error::Decoded keystore is empty.'; exit 1; }
+          keytool -list -keystore "$KEYSTORE_FILE" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" > /dev/null
+
+          # Keystore 中证书的 SHA-256 指纹（不是私钥，打印这个值是安全的）。
+          signing_sha256=$(keytool -exportcert -keystore "$KEYSTORE_FILE" \
+            -storepass "$STORE_PASS" -alias "$KEY_ALIAS" | openssl dgst -sha256 | awk '{print tolower($NF)}')
+          [[ "$signing_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Invalid keystore certificate fingerprint.'; exit 1; }
+
+          # 若设置了期望指纹，发现换签名立即失败，不允许生成不同证书的 APK。
+          if [ -n "$EXPECTED_CERT_SHA256" ]; then
+            pinned=$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+            if [ "$signing_sha256" != "$pinned" ]; then
+              echo '::error::Keystore certificate does not match ANDROID_SIGNING_CERT_SHA256.'
+              exit 1
+            fi
+          fi
+          echo "Android signing certificate SHA-256: $signing_sha256"
+
+          # SFA explicitly reads app/release.keystore and LOCAL_PROPERTIES.
+          # Provide the SAME persistent key already verified above. No new key.
+          install -m 600 "$KEYSTORE_FILE" app/release.keystore
+          export LOCAL_PROPERTIES="$(python3 - <<'PY_SIGNING_PROPERTIES'
+          import base64, os
+          
+          def escape_property(value):
+              return value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace(' ', '\\ ')
+          
+          props = (
+              'KEYSTORE_PASS=' + escape_property(os.environ['STORE_PASS']) + '\n'
+              'ALIAS_NAME=' + escape_property(os.environ['KEY_ALIAS']) + '\n'
+              'ALIAS_PASS=' + escape_property(os.environ['KEY_PASS']) + '\n'
+          )
+          print(base64.b64encode(props.encode()).decode())
+          PY_SIGNING_PROPERTIES
+          )"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleOtherRelease \
+            "-Pandroid.injected.signing.store.file=$KEYSTORE_FILE" \
+            "-Pandroid.injected.signing.store.password=$STORE_PASS" \
+            "-Pandroid.injected.signing.key.alias=$KEY_ALIAS" \
+            "-Pandroid.injected.signing.key.password=$KEY_PASS" \
+            --stacktrace
+
+          # 对实际上传的 arm64 APK 校验，而不是只相信 Gradle 参数。
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_DIR" || { echo '::error::ANDROID_HOME / ANDROID_SDK_ROOT is missing.'; exit 1; }
+          APKSIGNER=$(find "$SDK_DIR/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
+          test -x "$APKSIGNER" || { echo '::error::Android apksigner was not found.'; exit 1; }
+
+          # SIGNING-FINAL-20261024-R2: Re-sign the actual distributable APK
+          # with the persistent release key. This is intentionally independent
+          # of whether Gradle accepted android.injected.signing.* flags.
+          # apksigner removes prior signatures when signing an existing APK.
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/other/release/*arm64-v8a*.apk)
+          ((${#apks[@]} > 0)) || { echo '::error::No arm64 release APK to verify/upload.'; exit 1; }
+          for apk in "${apks[@]}"; do
+            signed_apk="${apk%.apk}.signed.apk"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE_FILE" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:STORE_PASS \
+              --key-pass env:KEY_PASS \
+              --out "$signed_apk" "$apk"
+            info=$("$APKSIGNER" verify --verbose --print-certs "$signed_apk") || {
+              echo "::error::APK signature verification failed: $signed_apk"; exit 1;
+            }
+            # apksigner versions differ: older "Signer #1 certificate ...",
+            # newer "V2 Signer: certificate ..." or "V3.0 Signer: ...".
+            # Read every certificate digest, requiring ONE consistent signer.
+            apk_sha256=$(printf '%s\n' "$info" |
+              awk '/certificate SHA-256 digest:/ {
+                sub(/^.*certificate SHA-256 digest:[[:space:]]*/, "")
+                gsub(/[:[:space:]]/, "")
+                print tolower($0)
+              }' | sort -u)
+            if [[ ! "$apk_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not parse a unique APK signing certificate: $apk"
+              printf '%s\n' "$info" | grep -Ei 'signer|certificate SHA-256' || true
+              exit 1
+            fi
+            echo "Expected signing cert SHA-256: $signing_sha256"
+            echo "Actual APK signer cert SHA-256: $apk_sha256"
+            if [ "$apk_sha256" != "$signing_sha256" ]; then
+              echo "::error::APK uses a DIFFERENT signing certificate: $apk"
+              exit 1
+            fi
+            # Replace distributable only AFTER the new APK passed verification.
+            mv -f -- "$signed_apk" "$apk"
+            echo "Verified signed APK: $apk (cert SHA-256: $apk_sha256)"
+          done
+
+      # 7. 上传 arm64-v8a 安装包
+      - name: Upload APK Product
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-arm64-v8a-naive-xhttp-release-apk
+          path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
+
+  # ------------------------------------------------------------------
+  # B. 命令行二进制: windows-amd64 / linux-amd64-musl / linux-arm64-musl
+  # ------------------------------------------------------------------
+  binaries:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            cgo: '0'
+            bin: sing-box.exe
+            extra_tags: ',with_purego'
+            libc_flag: ''
+            archive: zip
+          - name: linux-amd64-musl
+            goos: linux
+            goarch: amd64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
+            archive: tar
+          - name: linux-arm64-musl
+            goos: linux
+            goarch: arm64
+            cgo: '1'
+            bin: sing-box
+            extra_tags: ',with_musl'
+            libc_flag: '--libc=musl'
+            archive: tar
+
+    steps:
+      - name: Clone core (dateblue/intel)
+        run: |
+          set -euo pipefail
+          if [ -n "$CORE_REF" ]; then
+            git clone --depth 1 --branch "$CORE_REF" "$CORE_REPO" core
+          else
+            git clone --depth 1 "$CORE_REPO" core
+          fi
+          echo "CLI core SHA: $(git -C core rev-parse HEAD)"
+          test -f core/include/registry.go
+          test -f core/include/quic.go
+          test -f core/transport/v2ray/client_xhttp_enabled.go
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          cache: true
+          cache-dependency-path: core/go.sum
+
+      - *client_profile
+
+      - name: Resolve cronet-go version
+        run: |
+          set -euo pipefail
+          if [ -s core/.github/CRONET_GO_VERSION ]; then
+            V=$(tr -d '[:space:]' < core/.github/CRONET_GO_VERSION)
+          else
+            V=$(grep -oE 'cronet-go/all v[^ ]+' core/go.mod | head -n1 | awk '{print $2}' | sed -E 's/.*-([0-9a-f]{12})$/\1/')
+          fi
+          test -n "$V"
+          echo "cronet-go version: $V"
+          echo "CRONET_GO_VERSION=$V" >> "$GITHUB_ENV"
+
+      # ---------------- Linux (CGO) ----------------
+      - name: Clone cronet-go
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git ~/cronet-go
+          cd ~/cronet-go
+          git sparse-checkout set --no-cone '/*' '!/lib'
+          git checkout "$CRONET_GO_VERSION"
+          git submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} download-toolchain
+
+      - name: Set Chromium toolchain environment
+        if: matrix.cgo == '1'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} env >> "$GITHUB_ENV"
+
+      # ---------------- 编译 ----------------
+      - name: Build
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -xeuo pipefail
+          if [ -s core/release/LDFLAGS ]; then
+            LDFLAGS_SHARED=$(cat core/release/LDFLAGS)
+          else
+            LDFLAGS_SHARED="-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0"
+          fi
+          mkdir -p dist
+          cd core
+          go build -v -trimpath -buildvcs=false -o "../dist/${{ matrix.bin }}" \
+            -tags "${BASE_TAGS}${{ matrix.extra_tags }}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      # Ensure Linux artifacts do not depend on a musl/glibc dynamic loader
+      - name: Verify Linux static linkage
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          file dist/sing-box
+          readelf -h dist/sing-box | grep -E 'Class:|Machine:'
+          if readelf -l dist/sing-box | grep -q 'INTERP'; then
+            echo 'ERROR: Linux binary is dynamically linked and not portable.'
+            readelf -l dist/sing-box | grep -A1 INTERP
+            exit 1
+          fi
+          if readelf -d dist/sing-box | grep -q '(NEEDED)'; then
+            echo 'ERROR: Linux binary still has shared library dependencies.'
+            readelf -d dist/sing-box | grep '(NEEDED)'
+            exit 1
+          fi
+          echo 'PASS: no ELF interpreter or shared library dependencies'
+
+      # ---------------- Windows: purego 需要随附 libcronet.dll ----------------
+      - name: Fetch libcronet.dll
+        if: matrix.cgo == '0'
+        run: |
+          set -xeuo pipefail
+          LIB="lib/windows_${{ matrix.goarch }}/libcronet.dll"
+          git clone --filter=blob:none --no-checkout https://github.com/sagernet/cronet-go.git "$RUNNER_TEMP/cronet-go-lib"
+          cd "$RUNNER_TEMP/cronet-go-lib"
+          git sparse-checkout set --no-cone "/$LIB"
+          git checkout "$CRONET_GO_VERSION"
+          cp "$LIB" "$GITHUB_WORKSPACE/dist/"
+          test -s "$GITHUB_WORKSPACE/dist/libcronet.dll"
+
+      - name: Package
+        run: |
+          set -xeuo pipefail
+          NAME="sing-box-${VERSION}-${{ matrix.name }}"
+          mkdir -p "pkg/${NAME}"
+          cp dist/* "pkg/${NAME}/"
+          git -C core rev-parse HEAD > "pkg/${NAME}/source-commit.txt"
+          if [ -f core/LICENSE ]; then cp core/LICENSE "pkg/${NAME}/"; fi
+          ls -l "pkg/${NAME}"
+          cd pkg
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "${NAME}.zip" "${NAME}"
+          else
+            tar -czvf "${NAME}.tar.gz" "${NAME}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-${{ matrix.name }}
+          path: |
+            pkg/*.zip
+            pkg/*.tar.gz
+          if-no-files-found: error
