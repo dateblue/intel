@@ -7,6 +7,3 @@ const (
 	V2RayTransportTypeGRPC        = "grpc"
 	V2RayTransportTypeHTTPUpgrade = "httpupgrade"
 )
-
-// Additional XHTTP client transport.
-const V2RayTransportTypeXHTTP = "xhttp"

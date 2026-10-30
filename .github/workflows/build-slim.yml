@@ -1,17 +1,10 @@
-name: Build sing-box (SOCKS + XHTTP/Reality/Naive client + HY2/TUIC)
+name: Build sing-box PQC Slim (VLESS Reality / Naive / HY2 / TUIC v5 / SOCKS / TUN)
 
-# Install as .github/workflows/build-xhttp.yml on pqc-new.
-# The tracked core source stays official alpha13 + three feature patches.
-# At build time, the workflow creates a temporary minimal registry profile:
-# inbound: TUN, Redirect, TProxy, Direct, SOCKS, Hysteria2, TUIC v5
-# outbound: Direct, Bridge, Block, Selector, URLTest, SOCKS, VLESS/REALITY/XHTTP, Naive, Hysteria2, TUIC v5
-# The VLESS, Naive, and unrelated proxy inbounds are not registered.
-# DNS transports / Clash API / packaging / persistent Android signing remain unchanged.
-# 产物:
-#   1. sing-box-arm64-v8a-naive-release-apk   Android arm64 APK (带 naive + xhttp)
-#   2. sing-box-windows-amd64                 sing-box.exe + libcronet.dll (purego)
-#   3. sing-box-linux-amd64-musl              CGO + musl, 适合 OpenWrt/ImmortalWrt x86
-#   4. sing-box-linux-arm64-musl              CGO + musl (static)
+# Source profile is permanent in include/registry.go and include/quic.go.
+# All five proxy families have inbound + outbound support.
+# Full TUN, Redirect, TProxy, Fake-IP, DNS, route rules and Clash API remain.
+# XHTTP patch is entirely removed. Android, Windows and Linux artifacts use this same source profile.
+# Artifact targets: Android arm64 release APK; Windows amd64; Linux amd64/arm64 static-musl.
 
 on:
   push:
@@ -27,24 +20,23 @@ on:
       version:
         description: '写入二进制的版本号'
         required: false
-        default: '1.15.0-custom-naive-xhttp'
+        default: '1.15.0-pqc-slim'
         type: string
 
 env:
   CORE_REPO: https://github.com/dateblue/intel.git
   CORE_REF: ${{ inputs.core_ref || 'pqc-new' }}
-  VERSION: ${{ inputs.version || '1.15.0-custom-naive-xhttp' }}
-# 保留 QUIC(DNS/HY2/TUIC)、uTLS(REALITY/PQC)、Clash API、Naive 出站、XHTTP 客户端。
-  # with_naive 在这份源码中并非 Naive 的有效编译开关；with_naive_outbound 才是。
-  # 不启用 with_dhcp：用户使用独立路由器 DHCP/RA，且不需要 DHCP DNS。
-  BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,with_xhttp,badlinkname,tfogo_checklinkname0
+  VERSION: ${{ inputs.version || '1.15.0-pqc-slim' }}
+  # QUIC=HY2/TUIC/HTTP3 DNS; uTLS=Reality/PQC; Naive outbound is a build-tag opt-in.
+  # TUN, Fake-IP, SOCKS, VLESS inbound/outbound and sniff override are not build-tag gated.
+  BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,badlinkname,tfogo_checklinkname0
 
 jobs:
   # ------------------------------------------------------------------
-  # A. Android APK (arm64, 保留 naive + xhttp)
+  # A. Android APK (arm64, PQC slim)
   # ------------------------------------------------------------------
   apk:
-    name: Android APK (arm64, naive, xhttp)
+    name: Android APK (arm64, PQC slim)
     runs-on: ubuntu-24.04
 
     steps:
@@ -68,7 +60,9 @@ jobs:
           echo "Android core SHA: $(git -C sing-box rev-parse HEAD)"
           test -f sing-box/include/registry.go
           test -f sing-box/include/quic.go
-          test -f sing-box/transport/v2ray/client_xhttp_enabled.go
+          test ! -e sing-box/transport/v2rayxhttp
+          test ! -e sing-box/transport/v2ray/client_xhttp_enabled.go
+          python3 sing-box/scripts/verify_slim_profile.py
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -82,136 +76,6 @@ jobs:
           go-version: '1.27.3'
           cache: true
           cache-dependency-path: sing-box/go.sum
-
-      - &client_profile
-        name: Apply build-only client/server protocol profile
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_PROTOCOL_PROFILE'
-          from pathlib import Path
-          import re
-          
-          # Build-only profile: do not modify the tracked upstream alpha13 source.
-          roots = [p for p in (Path('sing-box'), Path('core')) if (p / 'include/registry.go').is_file()]
-          if len(roots) != 1:
-              raise SystemExit(f'Expected exactly one core checkout, found: {roots}')
-          root = roots[0]
-          
-          registry = root / 'include/registry.go'
-          quic = root / 'include/quic.go'
-          
-          # Keep TUN/Redirect/TProxy/direct and SOCKS inbounds; HY2/TUIC are in quic.go.
-          # Keep infrastructure outbounds plus SOCKS, VLESS (Reality + XHTTP) and Naive.
-          remove_registry = [
-              'http.RegisterInbound(registry)',
-              'mixed.RegisterInbound(registry)',
-              'shadowsocks.RegisterInbound(registry)',
-              'snell.RegisterInbound(registry)',
-              'vmess.RegisterInbound(registry)',
-              'trojan.RegisterInbound(registry)',
-              'naive.RegisterInbound(registry)',
-              'shadowtls.RegisterInbound(registry)',
-              'vless.RegisterInbound(registry)',
-              'anytls.RegisterInbound(registry)',
-              'registerCloudflaredInbound(registry)',
-              'registerTailcatInbound(registry)',
-              'registerStubForRemovedInbounds(registry)',
-              'http.RegisterOutbound(registry)',
-              'shadowsocks.RegisterOutbound(registry)',
-              'snell.RegisterOutbound(registry)',
-              'vmess.RegisterOutbound(registry)',
-              'trojan.RegisterOutbound(registry)',
-              'tor.RegisterOutbound(registry)',
-              'ssh.RegisterOutbound(registry)',
-              'shadowtls.RegisterOutbound(registry)',
-              'anytls.RegisterOutbound(registry)',
-              'registerTailcatOutbound(registry)',
-              'registerStubForRemovedOutbounds(registry)',
-              'registerWireGuardEndpoint(registry)',
-              'registerOpenConnectEndpoint(registry)',
-              'registerOpenVPNEndpoints(registry)',
-              'masque.RegisterEndpoint(registry)',
-              'registerTailscaleEndpoint(registry)',
-          ]
-          remove_quic = [
-              'hysteria.RegisterInbound(registry)',
-              'hysteria.RegisterOutbound(registry)',
-          ]
-          
-          
-          def drop_exact_lines(source, targets, label):
-              output = []
-              counts = {target: 0 for target in targets}
-              for line in source.splitlines(keepends=True):
-                  stripped = line.strip()
-                  if stripped in counts:
-                      counts[stripped] += 1
-                  else:
-                      output.append(line)
-              unexpected = {k: v for k, v in counts.items() if v != 1}
-              if unexpected:
-                  raise SystemExit(f'{label}: unexpected upstream layout, refusing to build: {unexpected}')
-              return ''.join(output)
-          
-          
-          def prune_imports(source, allowed_protocols):
-              lines = []
-              for line in source.splitlines(keepends=True):
-                  match = re.match(r'^\s*(?:_\s+)?"github\.com/sagernet/sing-box/protocol/([^"/]+)(?:/[^\"]+)?"', line)
-                  if match and match.group(1) not in allowed_protocols:
-                      continue
-                  if '"github.com/sagernet/sing-box/transport/v2rayquic"' in line:
-                      # No V2Ray-QUIC transport in the requested client-only protocol set.
-                      continue
-                  lines.append(line)
-              return ''.join(lines)
-          
-          registry_text = registry.read_text(encoding='utf-8')
-          registry_text = drop_exact_lines(registry_text, remove_registry, 'include/registry.go')
-          registry_text = prune_imports(registry_text, {'block', 'bridge', 'direct', 'group', 'redirect', 'socks', 'tun', 'vless'})
-          quic_text = quic.read_text(encoding='utf-8')
-          quic_text = drop_exact_lines(quic_text, remove_quic, 'include/quic.go')
-          quic_text = prune_imports(quic_text, {'hysteria2', 'tuic'})
-          
-          # Avoid silently building a different protocol profile if upstream changes.
-          registry_required = [
-              'tun.RegisterInbound(registry)',
-              'redirect.RegisterRedirect(registry)',
-              'redirect.RegisterTProxy(registry)',
-              'direct.RegisterInbound(registry)',
-              'socks.RegisterInbound(registry)',
-              'socks.RegisterOutbound(registry)',
-              'vless.RegisterOutbound(registry)',
-              'registerNaiveOutbound(registry)',
-              'registerQUICInbounds(registry)',
-              'registerQUICOutbounds(registry)',
-          ]
-          quic_required = [
-              'hysteria2.RegisterInbound(registry)',
-              'hysteria2.RegisterOutbound(registry)',
-              'tuic.RegisterInbound(registry)',
-              'tuic.RegisterOutbound(registry)',
-          ]
-          for entry in registry_required:
-              if registry_text.count(entry) != 1:
-                  raise SystemExit(f'Expected one registry entry: {entry}')
-          for entry in quic_required:
-              if quic_text.count(entry) != 1:
-                  raise SystemExit(f'Expected one QUIC entry: {entry}')
-          for forbidden in remove_registry:
-              if re.search(r'^\s*' + re.escape(forbidden) + r'\s*$', registry_text, re.M):
-                  raise SystemExit(f'Forbidden registry entry survived: {forbidden}')
-          for forbidden in remove_quic:
-              if re.search(r'^\s*' + re.escape(forbidden) + r'\s*$', quic_text, re.M):
-                  raise SystemExit(f'Forbidden QUIC entry survived: {forbidden}')
-          
-          registry.write_text(registry_text, encoding='utf-8', newline='')
-          quic.write_text(quic_text, encoding='utf-8', newline='')
-          print(f'Client/server profile applied to {root}: socks=in+out, vless=out, naive=out, hy2/tuic=in+out')
-          PY_PROTOCOL_PROFILE
-          if [ -d sing-box/include ]; then CORE_DIR=sing-box; else CORE_DIR=core; fi
-          gofmt -w "$CORE_DIR/include/registry.go" "$CORE_DIR/include/quic.go"
 
       # Gradle 打包仍使用原来的 NDK 25
       - name: Setup Android SDK & NDK 25
@@ -227,29 +91,15 @@ jobs:
         with:
           ndk-version: r28
 
-      # 3. 精简 libbox 构建标签：去掉 wireguard / usbip / openvpn / openconnect / tailscale
-      #    保留 quic / utls / clash_api / naive_outbound / xhttp
-      - name: Slim libbox build tags (keep naive & xhttp)
+      # Shared Android libbox flags are permanently slim in the source tree.
+      - name: Verify slim libbox build tags
         run: |
-          F=sing-box/cmd/internal/build_libbox/main.go
-          sed -i 's/"with_wireguard", //; s/"with_usbip", //; s/"with_openvpn", //; s/"with_openconnect", //' "$F"
-          sed -i '/sharedTags = append(sharedTags, "with_tailscale"/d' "$F"
-          echo "---- sharedTags lines after patch ----"
-          grep -n 'sharedTags = append' "$F"
-          if grep 'sharedTags = append' "$F" | grep -qE 'with_(wireguard|usbip|openvpn|openconnect|tailscale)'; then
-            echo "slimming failed: heavy tags still present"; exit 1
-          fi
-          if ! grep 'sharedTags = append' "$F" | grep -q 'with_naive_outbound'; then
-            echo "with_naive_outbound missing from sharedTags"; exit 1
-          fi
-          # 【改动 2】检查并确保 Android libbox 标签中包含 with_xhttp
-          if ! grep 'sharedTags = append' "$F" | grep -q 'with_xhttp'; then
-            echo "with_xhttp missing from sharedTags, appending..."
-            sed -i '/sharedTags = append(sharedTags/s/)/, "with_xhttp")/' "$F"
-          fi
+          set -euo pipefail
+          python3 sing-box/scripts/verify_slim_profile.py
+          grep -n 'sharedTags = append' sing-box/cmd/internal/build_libbox/main.go
 
       # 4. 编译核心 (仅 arm64)
-      - name: Build Libbox Core (arm64, naive, xhttp)
+      - name: Build Libbox Core (arm64, PQC slim)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -390,7 +240,7 @@ jobs:
       - name: Upload APK Product
         uses: actions/upload-artifact@v7
         with:
-          name: sing-box-arm64-v8a-naive-xhttp-release-apk
+          name: sing-box-arm64-v8a-pqc-slim-release-apk
           path: app/build/outputs/apk/other/release/*arm64-v8a*.apk
 
   # ------------------------------------------------------------------
@@ -441,7 +291,9 @@ jobs:
           echo "CLI core SHA: $(git -C core rev-parse HEAD)"
           test -f core/include/registry.go
           test -f core/include/quic.go
-          test -f core/transport/v2ray/client_xhttp_enabled.go
+          test ! -e core/transport/v2rayxhttp
+          test ! -e core/transport/v2ray/client_xhttp_enabled.go
+          python3 core/scripts/verify_slim_profile.py
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -450,7 +302,6 @@ jobs:
           cache: true
           cache-dependency-path: core/go.sum
 
-      - *client_profile
 
       - name: Resolve cronet-go version
         run: |
@@ -498,6 +349,9 @@ jobs:
           go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} ${{ matrix.libc_flag }} env >> "$GITHUB_ENV"
 
       # ---------------- 编译 ----------------
+      - name: Verify slim source before compiling
+        run: python3 core/scripts/verify_slim_profile.py
+
       - name: Build
         env:
           CGO_ENABLED: ${{ matrix.cgo }}
