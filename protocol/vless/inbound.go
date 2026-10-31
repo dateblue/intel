@@ -54,6 +54,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:  logger,
 		users:   options.Users,
 	}
+	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
+		if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
+			return nil, E.New("sbxhttp inbound requires Reality")
+		}
+		if common.PtrValueOrDefault(options.Multiplex).Enabled {
+			return nil, E.New("sbxhttp inbound does not support multiplex")
+		}
+		for _, user := range options.Users {
+			if user.Flow != "" {
+				return nil, E.New("sbxhttp inbound does not support Vision flow")
+			}
+		}
+	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
 	if err != nil {

@@ -12,8 +12,9 @@ import (
 )
 
 type _V2RayTransportOptions struct {
-	Type               string                  `json:"type" enum:"http,ws,quic,grpc,httpupgrade"`
+	Type               string                  `json:"type" enum:"http,ws,quic,grpc,httpupgrade,sbxhttp"`
 	HTTPOptions        V2RayHTTPOptions        `json:"-"`
+	SBXHTTPOptions     V2RaySBXHTTPOptions     `json:"-"`
 	WebsocketOptions   V2RayWebsocketOptions   `json:"-"`
 	QUICOptions        V2RayQUICOptions        `json:"-"`
 	GRPCOptions        V2RayGRPCOptions        `json:"-"`
@@ -27,6 +28,8 @@ func (o V2RayTransportOptions) MarshalJSON() ([]byte, error) {
 	switch o.Type {
 	case C.V2RayTransportTypeHTTP:
 		v = o.HTTPOptions
+	case C.V2RayTransportTypeSBXHTTP:
+		v = o.SBXHTTPOptions
 	case C.V2RayTransportTypeWebsocket:
 		v = o.WebsocketOptions
 	case C.V2RayTransportTypeQUIC:
@@ -52,6 +55,8 @@ func (o *V2RayTransportOptions) UnmarshalJSON(bytes []byte) error {
 	switch o.Type {
 	case C.V2RayTransportTypeHTTP:
 		v = &o.HTTPOptions
+	case C.V2RayTransportTypeSBXHTTP:
+		v = &o.SBXHTTPOptions
 	case C.V2RayTransportTypeWebsocket:
 		v = &o.WebsocketOptions
 	case C.V2RayTransportTypeQUIC:
@@ -74,12 +79,19 @@ func (o V2RayTransportOptions) DescribeSchema(builder schema.Builder) (*schema.N
 	return builder.Define("V2RayTransport", func() (*schema.Node, error) {
 		return schema.DiscriminatedUnion(builder, "type", true, []schema.UnionVariant{
 			{Value: C.V2RayTransportTypeHTTP, StructType: reflect.TypeFor[V2RayHTTPOptions]()},
+			{Value: C.V2RayTransportTypeSBXHTTP, StructType: reflect.TypeFor[V2RaySBXHTTPOptions]()},
 			{Value: C.V2RayTransportTypeWebsocket, StructType: reflect.TypeFor[V2RayWebsocketOptions]()},
 			{Value: C.V2RayTransportTypeQUIC, StructType: reflect.TypeFor[V2RayQUICOptions]()},
 			{Value: C.V2RayTransportTypeGRPC, StructType: reflect.TypeFor[V2RayGRPCOptions]()},
 			{Value: C.V2RayTransportTypeHTTPUpgrade, StructType: reflect.TypeFor[V2RayHTTPUpgradeOptions]()},
 		}, nil)
 	})
+}
+
+// SBXHTTP is a private sing-box-to-sing-box tunnel; not Xray-compatible.
+// All connection management settings are deliberately internal.
+type V2RaySBXHTTPOptions struct {
+	Path string `json:"path,omitempty"`
 }
 
 type V2RayHTTPOptions struct {

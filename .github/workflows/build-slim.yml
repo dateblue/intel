@@ -1,9 +1,10 @@
-name: Build sing-box PQC Slim (VLESS Reality / Naive / HY2 / TUIC v5 / SOCKS / TUN)
+name: Build sing-box PQC Slim + SB-XHTTP Stage 1 (Reality / PQC)
 
 # Source profile is permanent in include/registry.go and include/quic.go.
 # All five proxy families have inbound + outbound support.
 # Full TUN, Redirect, TProxy, Fake-IP, DNS, route rules and Clash API remain.
-# XHTTP patch is entirely removed. Android, Windows and Linux artifacts use this same source profile.
+# Legacy Xray XHTTP patch is removed; standalone SB-XHTTP is built-in (no with_xhttp tag).
+# Android, Windows and Linux artifacts use the same source profile.
 # Artifact targets: Android arm64 release APK; Windows amd64; Linux amd64/arm64 static-musl.
 
 on:
@@ -20,23 +21,23 @@ on:
       version:
         description: '写入二进制的版本号'
         required: false
-        default: '1.15.0-pqc-slim'
+        default: '1.15.0-pqc-slim-sbxhttp-s1'
         type: string
 
 env:
   CORE_REPO: https://github.com/dateblue/intel.git
   CORE_REF: ${{ inputs.core_ref || 'pqc-new' }}
-  VERSION: ${{ inputs.version || '1.15.0-pqc-slim' }}
+  VERSION: ${{ inputs.version || '1.15.0-pqc-slim-sbxhttp-s1' }}
   # QUIC=HY2/TUIC/HTTP3 DNS; uTLS=Reality/PQC; Naive outbound is a build-tag opt-in.
-  # TUN, Fake-IP, SOCKS, VLESS inbound/outbound and sniff override are not build-tag gated.
+  # SB-XHTTP, TUN, Fake-IP, SOCKS, VLESS inbound/outbound and sniff override are not build-tag gated.
   BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,badlinkname,tfogo_checklinkname0
 
 jobs:
   # ------------------------------------------------------------------
-  # A. Android APK (arm64, PQC slim)
+  # A. Android APK (arm64, PQC slim + SB-XHTTP)
   # ------------------------------------------------------------------
   apk:
-    name: Android APK (arm64, PQC slim)
+    name: Android APK (arm64, PQC slim + SB-XHTTP)
     runs-on: ubuntu-24.04
 
     steps:
@@ -62,6 +63,9 @@ jobs:
           test -f sing-box/include/quic.go
           test ! -e sing-box/transport/v2rayxhttp
           test ! -e sing-box/transport/v2ray/client_xhttp_enabled.go
+          test -f sing-box/transport/sbxhttp/client.go
+          test -f sing-box/transport/sbxhttp/server.go
+          test -f sing-box/transport/sbxhttp/conn.go
           python3 sing-box/scripts/verify_slim_profile.py
 
       - name: Set up Java
@@ -293,6 +297,9 @@ jobs:
           test -f core/include/quic.go
           test ! -e core/transport/v2rayxhttp
           test ! -e core/transport/v2ray/client_xhttp_enabled.go
+          test -f core/transport/sbxhttp/client.go
+          test -f core/transport/sbxhttp/server.go
+          test -f core/transport/sbxhttp/conn.go
           python3 core/scripts/verify_slim_profile.py
 
       - name: Set up Go
@@ -302,6 +309,18 @@ jobs:
           cache: true
           cache-dependency-path: core/go.sum
 
+
+      # First verify SB-XHTTP as a native Linux test (one job only, before cross builds).
+      # Naive outbound is omitted from these package-level tests; full build below still includes it.
+      - name: Test SB-XHTTP packages (Go race detector)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          cd core
+          go test -race -count=1 -timeout=300s \
+            -tags 'with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0' \
+            -ldflags '-checklinkname=0' \
+            ./transport/sbxhttp ./transport/v2ray ./protocol/vless ./option
 
       - name: Resolve cronet-go version
         run: |

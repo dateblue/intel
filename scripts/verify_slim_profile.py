@@ -57,8 +57,32 @@ for path in [
     "transport/v2rayxhttp", "common/badh2/stream_error.go",
 ]:
     check(not (root / path).exists(), f"XHTTP file remains: {path}")
+# Distinguish removed legacy Xray XHTTP from the new, independent SB-XHTTP.
+# A plain substring search for "xhttp" would incorrectly reject "sbxhttp".
+legacy_xhttp = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])xhttp(?![A-Za-z0-9_])|"
+    r"v2rayxhttp|"
+    r"(?<![A-Za-z0-9_])V2RayTransportTypeXHTTP(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])XHTTPOptions(?![A-Za-z0-9_])"
+)
 for path in ["constant/v2ray.go", "option/v2ray_transport.go", "transport/v2ray/transport.go"]:
-    check(not re.search(r"xhttp", source(path), flags=re.I), f"XHTTP reference remains: {path}")
+    check(not legacy_xhttp.search(source(path)), f"Legacy XHTTP reference remains: {path}")
+
+# Ensure BOTH ends of the private SB-XHTTP transport remain in this profile.
+for path in [
+    "transport/sbxhttp/client.go", "transport/sbxhttp/server.go",
+    "transport/sbxhttp/conn.go", "transport/sbxhttp/conn_test.go",
+]:
+    check((root / path).is_file(), f"SB-XHTTP source missing: {path}")
+for path, marker in [
+    ("constant/v2ray.go", "V2RayTransportTypeSBXHTTP"),
+    ("option/v2ray_transport.go", "V2RaySBXHTTPOptions"),
+    ("transport/v2ray/transport.go", "sbxhttp.NewClient"),
+    ("transport/v2ray/transport.go", "sbxhttp.NewServer"),
+    ("protocol/vless/inbound.go", "V2RayTransportTypeSBXHTTP"),
+    ("protocol/vless/outbound.go", "V2RayTransportTypeSBXHTTP"),
+]:
+    check(marker in source(path), f"SB-XHTTP registration missing: {path}: {marker}")
 check("with_xhttp" not in workflow.split("BASE_TAGS:",1)[-1].split("\n",1)[0], "XHTTP build tag remains")
 check("with_xhttp" not in libbox, "XHTTP libbox build tag remains")
 
@@ -87,4 +111,4 @@ if errors:
     for error in errors:
         print("  -", error)
     sys.exit(1)
-print("PASS: VLESS/Reality, Naive, HY2, TUIC v5, SOCKS in+out, TUN, PQC, sniff override, no XHTTP")
+print("PASS: PQC Slim + private SB-XHTTP in/out; legacy Xray XHTTP absent")

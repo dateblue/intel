@@ -7,6 +7,7 @@ import (
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/sbxhttp"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing-box/transport/v2rayhttpupgrade"
 	"github.com/sagernet/sing-box/transport/v2raywebsocket"
@@ -28,6 +29,8 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
 	switch options.Type {
 	case C.V2RayTransportTypeHTTP:
 		return v2rayhttp.NewServer(ctx, logger, options.HTTPOptions, tlsConfig, handler)
+	case C.V2RayTransportTypeSBXHTTP:
+		return sbxhttp.NewServer(ctx, logger, options.SBXHTTPOptions, tlsConfig, handler)
 	case C.V2RayTransportTypeWebsocket:
 		return v2raywebsocket.NewServer(ctx, logger, options.WebsocketOptions, tlsConfig, handler)
 	case C.V2RayTransportTypeQUIC:
@@ -51,6 +54,8 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 	switch options.Type {
 	case C.V2RayTransportTypeHTTP:
 		return v2rayhttp.NewClient(ctx, dialer, serverAddr, options.HTTPOptions, tlsConfig)
+	case C.V2RayTransportTypeSBXHTTP:
+		return sbxhttp.NewClient(ctx, dialer, serverAddr, options.SBXHTTPOptions, tlsConfig)
 	case C.V2RayTransportTypeGRPC:
 		return NewGRPCClient(ctx, dialer, serverAddr, options.GRPCOptions, tlsConfig)
 	case C.V2RayTransportTypeWebsocket:
