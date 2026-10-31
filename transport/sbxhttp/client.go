@@ -92,9 +92,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			if err != nil {
 				return nil, err
 			}
-			if raw.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
+			negotiated := raw.ConnectionState().NegotiatedProtocol
+			if !privateH2ALPNAllowed(negotiated) {
 				raw.Close()
-				return nil, errors.New("sbxhttp: Reality handshake did not negotiate h2")
+				return nil, fmt.Errorf("sbxhttp: Reality negotiated ALPN %q instead of h2", negotiated)
 			}
 			if !conn.setPhysical(raw) {
 				raw.Close()

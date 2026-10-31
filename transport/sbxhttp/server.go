@@ -101,9 +101,17 @@ func (s *Server) serveOne(raw net.Conn) {
 		return
 	}
 	defer conn.Close()
-	if conn.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
-		s.logger.Debug("sbxhttp: reject non-h2 ALPN")
+	// A verified private Reality connection may report an empty negotiated
+	// ALPN with some uTLS/Reality combinations. In this SB-to-SB transport,
+	// both peers explicitly speak HTTP/2, so an absent ALPN is permitted.
+	// A positive negotiation of another protocol must still be rejected.
+	negotiated := conn.ConnectionState().NegotiatedProtocol
+	if !privateH2ALPNAllowed(negotiated) {
+		s.logger.Warn("sbxhttp: reject negotiated ALPN ", negotiated, " (expected h2)")
 		return
+	}
+	if negotiated == "" {
+		s.logger.Debug("sbxhttp: Reality handshake verified; ALPN absent, using private HTTP/2 framing")
 	}
 	h2 := &http2.Server{
 		MaxConcurrentStreams:         1, // one logical VLESS stream per physical H2 socket
