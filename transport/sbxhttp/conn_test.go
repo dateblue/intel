@@ -96,3 +96,40 @@ func TestClientPublishAndRead(t *testing.T) {
 	}
 	c.Close()
 }
+
+// Network reset must release old sessions but leave the transport reusable.
+// A permanent Close, by contrast, must still reject future DialContext calls.
+func TestClientResetDoesNotPermanentlyClose(t *testing.T) {
+	c := &Client{sessions: make(map[*clientConn]struct{})}
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	_, cancel := context.WithCancel(context.Background())
+	old := newClientConn(writer, cancel, c.removeSession)
+	c.sessions[old] = struct{}{}
+
+	c.Reset()
+	if c.closed.Load() {
+		t.Fatal("Reset permanently disabled the transport")
+	}
+	if !old.closed.Load() {
+		t.Fatal("Reset did not close the old session")
+	}
+	if len(c.sessions) != 0 {
+		t.Fatal("Reset did not remove the old session")
+	}
+
+	// Prove a new session can still be registered after the reset.
+	r2, w2 := io.Pipe()
+	defer r2.Close()
+	_, cancel2 := context.WithCancel(context.Background())
+	newConn := newClientConn(w2, cancel2, c.removeSession)
+	c.mu.Lock()
+	c.sessions[newConn] = struct{}{}
+	c.mu.Unlock()
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.closed.Load() || !newConn.closed.Load() {
+		t.Fatal("terminal Close failed to disable transport and close sessions")
+	}
+}

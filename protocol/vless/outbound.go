@@ -154,7 +154,14 @@ func (h *Outbound) MultiplexEnabled() bool {
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.transport != nil {
-		h.transport.Close()
+		// Some transports (notably SB-XHTTP) have a terminal Close method.
+		// Interface changes must reset active connections without disabling
+		// the outbound for all future dials.
+		if resetter, ok := h.transport.(interface{ Reset() }); ok {
+			resetter.Reset()
+		} else {
+			_ = h.transport.Close()
+		}
 	}
 	if h.multiplexDialer != nil {
 		h.multiplexDialer.Reset()

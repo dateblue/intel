@@ -141,10 +141,10 @@ func (c *Client) removeSession(conn *clientConn) {
 	c.mu.Unlock()
 }
 
-func (c *Client) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
-		return nil
-	}
+// Reset closes active sessions after a network/interface change, while keeping
+// this transport available for subsequent DialContext calls. Unlike Close,
+// it must not mark the Client permanently closed.
+func (c *Client) Reset() {
 	c.mu.Lock()
 	sessions := make([]*clientConn, 0, len(c.sessions))
 	for s := range c.sessions {
@@ -154,5 +154,13 @@ func (c *Client) Close() error {
 	for _, s := range sessions {
 		_ = s.Close()
 	}
+}
+
+// Close is terminal and is called when the outbound is actually destroyed.
+func (c *Client) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.Reset()
 	return nil
 }
