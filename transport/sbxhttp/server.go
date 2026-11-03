@@ -144,6 +144,7 @@ func (s *Server) serveOne(raw net.Conn) {
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ProtoMajor != 2 || r.Method != http.MethodPost || r.URL.Path != s.path {
+		s.logger.Debug("sbxhttp: reject HTTP request remote=", r.RemoteAddr, " proto=", r.Proto, " method=", r.Method, " path=", r.URL.Path)
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}

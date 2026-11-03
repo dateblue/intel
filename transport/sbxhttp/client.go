@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/net/http2"
@@ -39,6 +40,7 @@ type Client struct {
 	mu               sync.Mutex
 	sessions         map[*clientConn]struct{}
 	reliable         bool
+	logger           logger.ContextLogger
 	visionInnerTLS   bool
 	reliableSessions map[*reliableSession]struct{}
 }
@@ -57,6 +59,10 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }
+
+// SetLogger attaches the owning VLESS outbound logger without modifying the
+// generic V2Ray transport constructor API used by other protocols.
+func (c *Client) SetLogger(log logger.ContextLogger) { c.logger = log }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if c.reliable {

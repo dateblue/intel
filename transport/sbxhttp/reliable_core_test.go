@@ -211,3 +211,41 @@ func TestPhysicalResetPreservesLogicalSession(t *testing.T) {
 		t.Fatal("logical session was destroyed by interface reset")
 	}
 }
+
+// Under receiver backpressure, the send direction must still be able to
+// observe the last committed ACK. Previously acceptData held rxMu across
+// net.Pipe.Write, creating a potential bidirectional deadlock.
+func TestReplayACKReadNotBlockedBySlowConsumer(t *testing.T) {
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- s.acceptData(0, []byte("x")) }()
+	// Ensure the write has reached net.Pipe before checking the short lock.
+	time.Sleep(15 * time.Millisecond)
+	ackDone := make(chan uint64, 1)
+	go func() { ackDone <- s.ackOffset() }()
+	select {
+	case got := <-ackDone:
+		if got != 0 {
+			t.Fatalf("ACK before delivery: %d", got)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ackOffset blocked on stalled logical reader")
+	}
+	// Release blocked write by consuming one byte.
+	got := make([]byte, 1)
+	if _, err := io.ReadFull(s.conn(), got); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delivery did not finish")
+	}
+	if gotAck := s.ackOffset(); gotAck != 1 {
+		t.Fatalf("ACK after delivery: %d", gotAck)
+	}
+}

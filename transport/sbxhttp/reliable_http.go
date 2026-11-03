@@ -24,6 +24,8 @@ const (
 	reliableResumeGrace  = 30 * time.Second
 )
 
+var errReliablePeerRejected = errors.New("sbxhttp: reliable peer rejected session")
+
 func randomSessionID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -52,7 +54,7 @@ func (c *Client) runReliableClient(sess *reliableSession, id string, ready chan<
 		}
 		attemptStart := time.Now()
 		connected := false
-		_ = c.reliableAttempt(sess, id, func() {
+		attemptErr := c.reliableAttempt(sess, id, func() {
 			connected = true
 			if !established {
 				established = true
@@ -61,6 +63,20 @@ func (c *Client) runReliableClient(sess *reliableSession, id string, ready chan<
 		})
 		if sess.ctx.Err() != nil {
 			return
+		}
+		if attemptErr != nil && !errors.Is(attemptErr, context.Canceled) && !errors.Is(attemptErr, net.ErrClosed) {
+			if c.logger != nil {
+				c.logger.Debug("sbxhttp: reliable attempt failed session=", id[:8], " connected=", connected, " err=", attemptErr)
+			}
+			// Protocol-level refusal is not transient. Return it to the
+			// caller instead of silently retrying until a generic timeout.
+			if !established && errors.Is(attemptErr, errReliablePeerRejected) {
+				select {
+				case ready <- attemptErr:
+				default:
+				}
+				return
+			}
 		}
 		// Recovery grace starts only AFTER an actually working physical socket
 		// disconnects; a healthy multi-hour socket must still get 30s to resume.
@@ -142,9 +158,12 @@ func (c *Client) reliableAttempt(sess *reliableSession, id string, established f
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 || resp.Header.Get("X-SBXHTTP-Version") != reliableVersion {
-		return fmt.Errorf("sbxhttp: incompatible reliable peer: %s version=%q", resp.Status, resp.Header.Get("X-SBXHTTP-Version"))
+		return fmt.Errorf("%w: %s version=%q", errReliablePeerRejected, resp.Status, resp.Header.Get("X-SBXHTTP-Version"))
 	}
 	established()
+	if c.logger != nil {
+		c.logger.Debug("sbxhttp: reliable HTTP/2 ready session=", id[:8], " remote=", c.serverAddr)
+	}
 	// Receiving DATA (and its confirmation after delivery into the logical
 	// stream) is serialized per attempt. After failure the next socket replays.
 	return sess.recvFrames(resp.Body)
@@ -181,7 +200,14 @@ func (c *Client) dialReliable(ctx context.Context) (net.Conn, error) {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
-	case <-ready:
+	case result := <-ready:
+		if result != nil {
+			sess.Close()
+			return nil, result
+		}
+		if err := sess.ctx.Err(); err != nil {
+			return nil, err
+		}
 		return sess.conn(), nil
 	case <-timer.C:
 		sess.Close()
@@ -207,11 +233,13 @@ func (s *Server) reliableHandlerDone(id string, sess *reliableSession) {
 }
 func (s *Server) reliableAttach(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-SBXHTTP-Version") != reliableVersion {
+		s.logger.Debug("sbxhttp: reject reliable version remote=", r.RemoteAddr, " version=", r.Header.Get("X-SBXHTTP-Version"))
 		http.Error(w, "SB-XHTTP v2 required", http.StatusUpgradeRequired)
 		return
 	}
 	id := r.Header.Get("X-SBXHTTP-Session")
 	if !validSessionID(id) {
+		s.logger.Debug("sbxhttp: reject invalid session ID remote=", r.RemoteAddr)
 		http.Error(w, "invalid session ID", http.StatusBadRequest)
 		return
 	}
@@ -233,22 +261,6 @@ func (s *Server) reliableAttach(w http.ResponseWriter, r *http.Request) {
 		s.reliableSessions[id] = sess
 	}
 	s.mu.Unlock()
-	if !ok {
-		source := M.ParseSocksaddr(r.RemoteAddr)
-		app := sess.conn()
-		go func() {
-			if s.visionInnerTLS {
-				wrapped, err := privateVisionServerTLS(sess.ctx, app, s.privateVisionTLS)
-				if err != nil {
-					s.logger.Debug("sbxhttp: private Vision reliable handshake: ", err)
-					sess.Close()
-					return
-				}
-				app = wrapped
-			}
-			s.handler.NewConnectionEx(sess.ctx, app, source, M.Socksaddr{}, N.OnceClose(func(error) { s.reliableHandlerDone(id, sess) }))
-		}()
-	}
 	if sess.closed.Load() {
 		http.Error(w, "session closed", http.StatusGone)
 		return
@@ -296,16 +308,46 @@ func (s *Server) reliableAttach(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	rc := http.NewResponseController(w)
 	if err := rc.Flush(); err != nil {
+		s.logger.Debug("sbxhttp: reliable initial HTTP/2 flush failed remote=", r.RemoteAddr, " err=", err)
+		if !ok {
+			sess.Close()
+		}
 		return
+	}
+	s.logger.Debug("sbxhttp: reliable attached session=", id[:8], " resumed=", ok, " remote=", r.RemoteAddr)
+	// Start the application only after the first attachment is accepted and
+	// response headers are flushed; rejected attaches must not spawn orphaned
+	// VLESS/Encryption handlers.
+	if !ok {
+		source := M.ParseSocksaddr(r.RemoteAddr)
+		app := sess.conn()
+		go func() {
+			if s.visionInnerTLS {
+				wrapped, err := privateVisionServerTLS(sess.ctx, app, s.privateVisionTLS)
+				if err != nil {
+					s.logger.Debug("sbxhttp: private Vision reliable handshake: ", err)
+					sess.Close()
+					return
+				}
+				app = wrapped
+			}
+			s.handler.NewConnectionEx(sess.ctx, app, source, M.Socksaddr{}, N.OnceClose(func(error) { s.reliableHandlerDone(id, sess) }))
+		}()
 	}
 	receiveDone := make(chan error, 1)
 	go func() { receiveDone <- sess.recvFrames(r.Body); cancel() }()
-	_ = sess.sendFrames(attemptCtx, w, rc.Flush)
+	sendErr := sess.sendFrames(attemptCtx, w, rc.Flush)
+	if sendErr != nil && !errors.Is(sendErr, context.Canceled) && !errors.Is(sendErr, net.ErrClosed) {
+		s.logger.Debug("sbxhttp: reliable downlink stopped session=", id[:8], " err=", sendErr)
+	}
 	cancel()
 	// r.Body read observes request cancellation; don't block response cleanup
 	// indefinitely if a local VLESS reader is legitimately backpressured.
 	select {
-	case <-receiveDone:
+	case recvErr := <-receiveDone:
+		if recvErr != nil && !errors.Is(recvErr, context.Canceled) && !errors.Is(recvErr, io.EOF) && !errors.Is(recvErr, net.ErrClosed) {
+			s.logger.Debug("sbxhttp: reliable uplink stopped session=", id[:8], " err=", recvErr)
+		}
 	case <-time.After(3 * time.Second):
 	}
 }

@@ -183,6 +183,7 @@ type reliableSession struct {
 	peer           net.Conn
 	tx             *replayBuffer
 	rxMu           sync.Mutex
+	rxWriteMu      sync.Mutex // serialize peer writes without blocking ACK reads
 	rx             uint64
 	ackChanged     chan struct{}
 	closed         atomic.Bool
@@ -263,22 +264,32 @@ func (s *reliableSession) pump() {
 }
 func (s *reliableSession) ackOffset() uint64 { s.rxMu.Lock(); defer s.rxMu.Unlock(); return s.rx }
 func (s *reliableSession) acceptData(seq uint64, b []byte) error {
+	// A logical reader may stall while the remote application is busy. Never
+	// hold rxMu across net.Pipe.Write: the outbound HTTP/2 writer needs
+	// ackOffset() to make progress concurrently, otherwise both directions
+	// can deadlock under backpressure.
+	// Serialize deliveries (including any overlapping physical attempts)
+	// separately from the short lock protecting the acknowledged offset.
+	s.rxWriteMu.Lock()
+	defer s.rxWriteMu.Unlock()
 	s.rxMu.Lock()
-	defer s.rxMu.Unlock()
-	if seq > s.rx {
+	current := s.rx
+	s.rxMu.Unlock()
+	if seq > current {
 		return errSequenceGap
 	}
-	if seq+uint64(len(b)) <= s.rx {
+	if seq+uint64(len(b)) <= current {
 		return nil
-	} // complete duplicate
-	skip := int(s.rx - seq)
-	b = b[skip:]
+	}
+	b = b[int(current-seq):]
 	for len(b) > 0 {
 		_ = s.peer.SetWriteDeadline(time.Now().Add(logicalWriteStall))
 		n, err := s.peer.Write(b)
 		_ = s.peer.SetWriteDeadline(time.Time{})
-		s.rx += uint64(n)
 		if n > 0 {
+			s.rxMu.Lock()
+			s.rx += uint64(n)
+			s.rxMu.Unlock()
 			select {
 			case s.ackChanged <- struct{}{}:
 			default:

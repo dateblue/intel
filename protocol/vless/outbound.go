@@ -49,6 +49,12 @@ type Outbound struct {
 	xudp            bool
 }
 
+// sbxhttpTransportLogger is declared at package scope so the logger package
+// is not shadowed by NewOutbound's logger parameter.
+type sbxhttpTransportLogger interface {
+	SetLogger(logger.ContextLogger)
+}
+
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
 	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
 		if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
@@ -107,6 +113,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
 		if err != nil {
 			return nil, E.Cause(err, "create client transport: ", options.Transport.Type)
+		}
+		if loggable, ok := outbound.transport.(sbxhttpTransportLogger); ok {
+			loggable.SetLogger(logger)
 		}
 	}
 	if options.PacketEncoding == nil {
@@ -252,6 +261,7 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 			return nil, E.Cause(err, "VLESS encryption handshake")
 		}
 		conn = wrapped
+		h.logger.DebugContext(ctx, "VLESS encryption handshake completed")
 	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
