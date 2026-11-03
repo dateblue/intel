@@ -187,6 +187,7 @@ type reliableSession struct {
 	rx             uint64
 	ackChanged     chan struct{}
 	closed         atomic.Bool
+	appFinished    atomic.Bool // upper VLESS handler completed; late uplink must not abort downlink
 	closeOnce      sync.Once
 	finishOnce     sync.Once
 	lastDetached   atomic.Int64
@@ -219,6 +220,7 @@ func (*reliableAppConn) NeedAdditionalReadDeadline() bool { return true }
 // queued for HTTP/2 retransmission. An upper bound prevents stale sessions.
 func (s *reliableSession) finishApp() {
 	s.finishOnce.Do(func() {
+		s.appFinished.Store(true)
 		_ = s.app.Close()
 		time.AfterFunc(8*time.Second, s.Close)
 	})
@@ -263,6 +265,18 @@ func (s *reliableSession) pump() {
 	}
 }
 func (s *reliableSession) ackOffset() uint64 { s.rxMu.Lock(); defer s.rxMu.Unlock(); return s.rx }
+func (s *reliableSession) advanceRx(n uint64) {
+	if n == 0 {
+		return
+	}
+	s.rxMu.Lock()
+	s.rx += n
+	s.rxMu.Unlock()
+	select {
+	case s.ackChanged <- struct{}{}:
+	default:
+	}
+}
 func (s *reliableSession) acceptData(seq uint64, b []byte) error {
 	// A logical reader may stall while the remote application is busy. Never
 	// hold rxMu across net.Pipe.Write: the outbound HTTP/2 writer needs
@@ -282,21 +296,32 @@ func (s *reliableSession) acceptData(seq uint64, b []byte) error {
 		return nil
 	}
 	b = b[int(current-seq):]
+	// When the upper VLESS handler has closed, there may still be in-flight
+	// upload DATA on the already-established HTTP/2 request. net.Pipe.Write
+	// then returns io.ErrClosedPipe. Treating that as a physical attempt
+	// failure cancels the response and discards queued download/FIN bytes.
+	// Late bytes have no upper-layer consumer; acknowledge them as retired
+	// so they cannot repeatedly poison a resumed physical attachment.
+	if s.appFinished.Load() {
+		s.advanceRx(uint64(len(b)))
+		return nil
+	}
 	for len(b) > 0 {
 		_ = s.peer.SetWriteDeadline(time.Now().Add(logicalWriteStall))
 		n, err := s.peer.Write(b)
 		_ = s.peer.SetWriteDeadline(time.Time{})
 		if n > 0 {
-			s.rxMu.Lock()
-			s.rx += uint64(n)
-			s.rxMu.Unlock()
-			select {
-			case s.ackChanged <- struct{}{}:
-			default:
-			}
+			s.advanceRx(uint64(n))
 		}
 		b = b[n:]
 		if err != nil {
+			// app.Close can race with a blocked pipe write. Once the
+			// handler has completed, do not let this normal shutdown
+			// tear down the physical H2 downlink prematurely.
+			if s.appFinished.Load() && (errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed)) {
+				s.advanceRx(uint64(len(b)))
+				return nil
+			}
 			return err
 		}
 		if n == 0 {

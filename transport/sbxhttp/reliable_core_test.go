@@ -249,3 +249,47 @@ func TestReplayACKReadNotBlockedBySlowConsumer(t *testing.T) {
 		t.Fatalf("ACK after delivery: %d", gotAck)
 	}
 }
+
+// After VLESS has completed, the peer may have queued more request DATA
+// concurrently with the response. Closing the logical app must not make
+// those late bytes destroy an HTTP/2 downlink which still has response data.
+func TestReplayLateUplinkAfterAppClose(t *testing.T) {
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	s.finishApp()
+	if err := s.acceptData(0, []byte("late-data")); err != nil {
+		t.Fatalf("late uplink caused physical attempt failure: %v", err)
+	}
+	if got := s.ackOffset(); got != uint64(len("late-data")) {
+		t.Fatalf("unexpected ACK for retired uplink: %d", got)
+	}
+	// Duplicate frames are still safely ignored and a genuine future gap
+	// remains invalid; do not disable replay sequence validation.
+	if err := s.acceptData(0, []byte("late-data")); err != nil {
+		t.Fatalf("duplicate late data: %v", err)
+	}
+	if err := s.acceptData(11, []byte("bad")); err == nil {
+		t.Fatal("sequence gap accepted after app close")
+	}
+}
+
+func TestReplayCloseDuringBlockedUplink(t *testing.T) {
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.acceptData(0, []byte("pending")) }()
+	// The logical app intentionally does not consume pending bytes.
+	time.Sleep(15 * time.Millisecond)
+	s.finishApp()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("concurrent app close leaked to physical attempt: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending uplink remained blocked after app close")
+	}
+	if got := s.ackOffset(); got != uint64(len("pending")) {
+		t.Fatalf("partial/incorrect retired ACK: %d", got)
+	}
+}
