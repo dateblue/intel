@@ -26,6 +26,16 @@ const (
 
 var errReliablePeerRejected = errors.New("sbxhttp: reliable peer rejected session")
 
+// cancelReliableOnFailure preserves the HTTP/2 half-close: successful upload
+// completion (and normal request-body EOF on the server) must not cancel the
+// still-active response stream. Only genuine failures abort the attachment.
+func cancelReliableOnFailure(err error, cancel context.CancelFunc, allowEOF bool) {
+	if err == nil || (allowEOF && errors.Is(err, io.EOF)) {
+		return
+	}
+	cancel()
+}
+
 func randomSessionID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -161,8 +171,10 @@ func (c *Client) reliableAttempt(sess *reliableSession, id string, established f
 	}()
 	go func() {
 		defer bodyWriter.Close()
-		_ = sess.sendFrames(attemptCtx, bodyWriter, func() error { return nil })
-		cancel()
+		// Closing the upload is a half-close, not an HTTP/2 RST_STREAM.
+		// Keep the response body alive until recvFrames finishes.
+		sendErr := sess.sendFrames(attemptCtx, bodyWriter, func() error { return nil })
+		cancelReliableOnFailure(sendErr, cancel, false)
 	}()
 	// A deadline on initial session establishment must not limit the lifetime
 	// of a successfully established VLESS session.
@@ -356,7 +368,12 @@ func (s *Server) reliableAttach(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	receiveDone := make(chan error, 1)
-	go func() { receiveDone <- sess.recvFrames(r.Body); cancel() }()
+	go func() {
+		recvErr := sess.recvFrames(r.Body)
+		receiveDone <- recvErr
+		// A graceful request-body EOF must not kill a pending response.
+		cancelReliableOnFailure(recvErr, cancel, true)
+	}()
 	sendErr := sess.sendFrames(attemptCtx, w, rc.Flush)
 	if sendErr != nil && !errors.Is(sendErr, context.Canceled) && !errors.Is(sendErr, net.ErrClosed) {
 		s.logger.Debug("sbxhttp: reliable downlink stopped session=", id[:8], " err=", sendErr)
