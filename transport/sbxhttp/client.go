@@ -31,13 +31,16 @@ var _ adapter.V2RayClientTransport = (*Client)(nil)
 // Client is a small factory: it intentionally owns no shared HTTP/2 pool.
 // One call to DialContext == one independent TLS/TCP + HTTP/2 connection.
 type Client struct {
-	serverAddr M.Socksaddr
-	tlsDialer  tls.Dialer
-	config     tls.Config
-	target     url.URL
-	closed     atomic.Bool
-	mu         sync.Mutex
-	sessions   map[*clientConn]struct{}
+	serverAddr       M.Socksaddr
+	tlsDialer        tls.Dialer
+	config           tls.Config
+	target           url.URL
+	closed           atomic.Bool
+	mu               sync.Mutex
+	sessions         map[*clientConn]struct{}
+	reliable         bool
+	visionInnerTLS   bool
+	reliableSessions map[*reliableSession]struct{}
 }
 
 func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts option.V2RaySBXHTTPOptions, config tls.Config) (adapter.V2RayClientTransport, error) {
@@ -50,12 +53,19 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	}
 	// Explicit h2-only ALPN. Reality/uTLS is negotiated by sing-box's TLS stack.
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	c := &Client{serverAddr: serverAddr, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{})}
+	c := &Client{serverAddr: serverAddr, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{})}
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+	if c.reliable {
+		stream, err := c.dialReliable(ctx)
+		if err != nil || !c.visionInnerTLS {
+			return stream, err
+		}
+		return privateVisionClientTLS(ctx, stream)
+	}
 	if c.closed.Load() {
 		return nil, net.ErrClosed
 	}
@@ -81,6 +91,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	}
 	c.sessions[conn] = struct{}{}
 	c.mu.Unlock()
+	cancelPendingDial(ctx, conn)
 
 	req := (&http.Request{Method: http.MethodPost, URL: &c.target, Header: make(http.Header), Body: pr, ContentLength: -1}).WithContext(requestCtx)
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -140,6 +151,9 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		// body must remain open until the caller closes its net.Conn.
 		<-requestCtx.Done()
 	}()
+	if c.visionInnerTLS {
+		return privateVisionClientTLS(ctx, conn)
+	}
 	return conn, nil
 }
 
@@ -158,9 +172,20 @@ func (c *Client) Reset() {
 	for s := range c.sessions {
 		sessions = append(sessions, s)
 	}
+	reliable := make([]*reliableSession, 0, len(c.reliableSessions))
+	for s := range c.reliableSessions {
+		reliable = append(reliable, s)
+	}
 	c.mu.Unlock()
 	for _, s := range sessions {
 		_ = s.Close()
+	}
+	for _, s := range reliable {
+		if c.reliable && !c.closed.Load() {
+			s.resetPhysical()
+		} else {
+			s.Close()
+		}
 	}
 }
 

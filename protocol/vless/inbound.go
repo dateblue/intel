@@ -14,6 +14,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	VEnc "github.com/sagernet/sing-box/protocol/vless/encryption"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
@@ -44,6 +45,7 @@ type Inbound struct {
 	tlsConfig  tls.ServerConfig
 	transport  adapter.V2RayServerTransport
 	references []string
+	encryption *VEnc.Server
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
@@ -62,10 +64,35 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.New("sbxhttp inbound does not support multiplex")
 		}
 		for _, user := range options.Users {
-			if user.Flow != "" {
-				return nil, E.New("sbxhttp inbound does not support Vision flow")
+			if options.Decryption != "" && options.Decryption != "none" {
+				if options.Transport.SBXHTTPOptions.VisionInnerTLS {
+					return nil, E.New("sbxhttp decryption conflicts with vision_inner_tls")
+				}
+				if user.Flow != "" && user.Flow != "xtls-rprx-vision" {
+					return nil, E.New("unsupported VLESS decryption flow")
+				}
+			} else {
+				if user.Flow != "" && !(user.Flow == "xtls-rprx-vision" && options.Transport.SBXHTTPOptions.VisionInnerTLS) {
+					return nil, E.New("sbxhttp inbound Vision requires private vision_inner_tls or decryption")
+				}
+				if options.Transport.SBXHTTPOptions.VisionInnerTLS != (user.Flow == "xtls-rprx-vision") {
+					return nil, E.New("sbxhttp vision_inner_tls requires every user to use xtls-rprx-vision")
+				}
 			}
 		}
+	}
+	if options.Decryption != "" && options.Decryption != "none" {
+		if options.Transport == nil || options.Transport.Type != C.V2RayTransportTypeSBXHTTP {
+			return nil, E.New("experimental decryption requires private SB-XHTTP")
+		}
+		if options.Transport.SBXHTTPOptions.VisionInnerTLS {
+			return nil, E.New("decryption cannot use vision_inner_tls")
+		}
+		encryptionServer, e := VEnc.ParseServerSpec(options.Decryption)
+		if e != nil {
+			return nil, E.Cause(e, "parse VLESS decryption")
+		}
+		inbound.encryption = encryptionServer
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -172,6 +199,15 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			return
 		}
 		conn = tlsConn
+	}
+	if h.encryption != nil {
+		wrapped, e := h.encryption.Handshake(conn)
+		if e != nil {
+			N.CloseOnHandshakeFailure(conn, onClose, e)
+			h.logger.ErrorContext(ctx, E.Cause(e, "VLESS decryption handshake"))
+			return
+		}
+		conn = wrapped
 	}
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {

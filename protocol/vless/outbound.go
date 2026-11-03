@@ -12,6 +12,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	VEnc "github.com/sagernet/sing-box/protocol/vless/encryption"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
@@ -44,6 +45,7 @@ type Outbound struct {
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
 	packetAddr      bool
+	encryption      *VEnc.Client
 	xudp            bool
 }
 
@@ -52,12 +54,29 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
 			return nil, E.New("sbxhttp outbound requires Reality")
 		}
-		if options.Flow != "" {
-			return nil, E.New("sbxhttp outbound does not support Vision flow")
+		// Supported experimental Vision path: authenticated VLESS Encryption.
+		// Refuse combining legacy inner TLS with the real encryption layer.
+		if options.Encryption != "" && options.Encryption != "none" {
+			if options.Transport.SBXHTTPOptions.VisionInnerTLS {
+				return nil, E.New("sbxhttp VLESS encryption and vision_inner_tls are mutually exclusive")
+			}
+			if options.Flow != "" && options.Flow != "xtls-rprx-vision" {
+				return nil, E.New("unsupported VLESS encrypted flow")
+			}
+		} else {
+			if options.Flow != "" && !(options.Flow == "xtls-rprx-vision" && options.Transport.SBXHTTPOptions.VisionInnerTLS) {
+				return nil, E.New("sbxhttp Vision without encryption requires private vision_inner_tls")
+			}
+			if options.Transport.SBXHTTPOptions.VisionInnerTLS != (options.Flow == "xtls-rprx-vision") {
+				return nil, E.New("sbxhttp vision_inner_tls requires flow xtls-rprx-vision")
+			}
 		}
 		if common.PtrValueOrDefault(options.Multiplex).Enabled {
 			return nil, E.New("sbxhttp outbound does not support multiplex")
 		}
+	}
+	if options.Encryption != "" && options.Encryption != "none" && (options.Transport == nil || options.Transport.Type != C.V2RayTransportTypeSBXHTTP) {
+		return nil, E.New("experimental VLESS encryption currently requires private SB-XHTTP")
 	}
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
@@ -106,6 +125,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
 	if err != nil {
 		return nil, err
+	}
+	if options.Encryption != "" && options.Encryption != "none" {
+		outbound.encryption, err = VEnc.ParseClientSpec(options.Encryption)
+		if err != nil {
+			return nil, E.Cause(err, "parse VLESS encryption")
+		}
 	}
 	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vlessDialer)(outbound), logger, common.PtrValueOrDefault(options.Multiplex))
 	if err != nil {
@@ -219,6 +244,15 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	if err != nil {
 		return nil, err
 	}
+	if h.encryption != nil {
+		var wrapped *VEnc.CommonConn
+		wrapped, err = h.encryption.Handshake(conn)
+		if err != nil {
+			_ = conn.Close()
+			return nil, E.Cause(err, "VLESS encryption handshake")
+		}
+		conn = wrapped
+	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -261,6 +295,14 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	if err != nil {
 		common.Close(conn)
 		return nil, err
+	}
+	if h.encryption != nil {
+		wrapped, e := h.encryption.Handshake(conn)
+		if e != nil {
+			_ = conn.Close()
+			return nil, E.Cause(e, "VLESS encryption packet handshake")
+		}
+		conn = wrapped
 	}
 	if h.xudp {
 		return h.client.DialEarlyXUDPPacketConn(conn, destination)

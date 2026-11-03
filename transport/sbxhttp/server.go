@@ -2,6 +2,7 @@ package sbxhttp
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -25,16 +26,21 @@ var _ adapter.V2RayServerTransport = (*Server)(nil)
 const maxSockets = 512 // explicit bound, not an autoscaling / XMUX algorithm
 
 type Server struct {
-	ctx        context.Context
-	logger     logger.ContextLogger
-	handler    adapter.V2RayServerTransportHandler
-	tlsConfig  tls.ServerConfig
-	path       string
-	listener   net.Listener
-	closed     atomic.Bool
-	mu         sync.Mutex
-	rawSockets map[net.Conn]struct{}
-	slots      chan struct{}
+	ctx              context.Context
+	logger           logger.ContextLogger
+	handler          adapter.V2RayServerTransportHandler
+	tlsConfig        tls.ServerConfig
+	path             string
+	listener         net.Listener
+	closed           atomic.Bool
+	mu               sync.Mutex
+	rawSockets       map[net.Conn]struct{}
+	reliable         bool
+	visionInnerTLS   bool
+	privateVisionTLS *stdtls.Config
+	reliableSessions map[string]*reliableSession
+	reliableStop     chan struct{}
+	slots            chan struct{}
 }
 
 func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2RaySBXHTTPOptions, config tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (adapter.V2RayServerTransport, error) {
@@ -46,7 +52,14 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 		return nil, err
 	}
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets)}, nil
+	var visionConfig *stdtls.Config
+	if options.VisionInnerTLS {
+		visionConfig, err = newPrivateVisionServerTLS()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{})}, nil
 }
 func (s *Server) Network() []string                { return []string{N.NetworkTCP} }
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
@@ -63,6 +76,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 	s.listener = ln
 	s.mu.Unlock()
+	if s.reliable {
+		go s.sweepReliable()
+	}
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -131,6 +147,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if s.reliable {
+		s.reliableAttach(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -152,7 +172,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	done := make(chan struct{})
 	source := M.ParseSocksaddr(r.RemoteAddr)
-	s.handler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, N.OnceClose(func(error) { close(done) }))
+	var app net.Conn = conn
+	if s.visionInnerTLS {
+		wrapped, wrapErr := privateVisionServerTLS(ctx, conn, s.privateVisionTLS)
+		if wrapErr != nil {
+			s.logger.Debug("sbxhttp: private Vision inner TLS handshake: ", wrapErr)
+			return
+		}
+		app = wrapped
+	}
+	s.handler.NewConnectionEx(ctx, app, source, M.Socksaddr{}, N.OnceClose(func(error) { close(done) }))
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -166,13 +195,23 @@ func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	if s.reliableStop != nil {
+		close(s.reliableStop)
+	}
 	s.mu.Lock()
 	ln := s.listener
 	sockets := make([]net.Conn, 0, len(s.rawSockets))
 	for sock := range s.rawSockets {
 		sockets = append(sockets, sock)
 	}
+	reliable := make([]*reliableSession, 0, len(s.reliableSessions))
+	for _, sess := range s.reliableSessions {
+		reliable = append(reliable, sess)
+	}
 	s.mu.Unlock()
+	for _, sess := range reliable {
+		sess.Close()
+	}
 	if ln != nil {
 		_ = ln.Close()
 	}
