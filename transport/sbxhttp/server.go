@@ -92,15 +92,21 @@ func (s *Server) serveOne(raw net.Conn) {
 	defer func() { s.mu.Lock(); delete(s.rawSockets, raw); s.mu.Unlock(); <-s.slots; _ = raw.Close() }()
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
+	// A stalled/half-open TCP peer must not occupy one of the bounded socket
+	// slots indefinitely before completing the Reality/TLS handshake.
+	_ = raw.SetDeadline(time.Now().Add(C.TCPTimeout))
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, C.TCPTimeout)
 	// REALITY is explicitly authenticated before the HTTP/2 server sees bytes.
 	// http.Server.Serve cannot be used here because Reality wraps *tls.Conn:
 	// net/http's automatic h2 dispatch relies on the concrete *tls.Conn type.
-	conn, err := tls.ServerHandshake(ctx, raw, s.tlsConfig)
+	conn, err := tls.ServerHandshake(handshakeCtx, raw, s.tlsConfig)
+	cancelHandshake()
 	if err != nil {
 		s.logger.Debug("sbxhttp: Reality handshake: ", err)
 		return
 	}
 	defer conn.Close()
+	_ = raw.SetDeadline(time.Time{})
 	// A verified private Reality connection may report an empty negotiated
 	// ALPN with some uTLS/Reality combinations. In this SB-to-SB transport,
 	// both peers explicitly speak HTTP/2, so an absent ALPN is permitted.
@@ -113,11 +119,7 @@ func (s *Server) serveOne(raw net.Conn) {
 	if negotiated == "" {
 		s.logger.Debug("sbxhttp: Reality handshake verified; ALPN absent, using private HTTP/2 framing")
 	}
-	h2 := &http2.Server{
-		MaxConcurrentStreams:         1, // one logical VLESS stream per physical H2 socket
-		MaxUploadBufferPerStream:     4 << 20,
-		MaxUploadBufferPerConnection: 4 << 20,
-	}
+	h2 := newH2Server()
 	h2.ServeConn(conn, &http2.ServeConnOpts{
 		Context:    ctx,
 		Handler:    http.HandlerFunc(s.serveHTTP),

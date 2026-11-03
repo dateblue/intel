@@ -20,7 +20,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -59,6 +58,12 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if c.closed.Load() {
 		return nil, net.ErrClosed
+	}
+	// Respect a shorter caller deadline during the initial HTTP/2 handshake.
+	// The connection lifetime remains independent of the transient dial ctx.
+	handshakeTimeout, err := boundedHandshakeTimeout(ctx)
+	if err != nil {
+		return nil, err
 	}
 	// VLESS uses early writes; the request must be full-duplex and must live
 	// longer than a transient per-dial context. It is explicitly cancelled on
@@ -103,13 +108,16 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			}
 			return raw, nil
 		},
-		// No ReadIdleTimeout/Ping timeout: idle != stalled. We do not abort
-		// active IPTV streams due to an unproven synthetic health threshold.
+		// PING runs only when no H2 frames are received. It probes a dead TCP
+		// path, without applying an idle timeout to valid VLESS streams.
+		ReadIdleTimeout:  h2ReadIdleTimeout,
+		PingTimeout:      h2PingTimeout,
+		WriteByteTimeout: h2WriteByteTimeout,
 	}
 	go func() {
 		defer tr.CloseIdleConnections()
 		defer pr.Close()
-		timer := time.AfterFunc(C.TCPTimeout, func() {
+		timer := time.AfterFunc(handshakeTimeout, func() {
 			if conn.publish(nil, context.DeadlineExceeded) {
 				_ = conn.Close() // release only if timeout won the response race
 			}
