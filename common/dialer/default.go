@@ -228,6 +228,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	}
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
+		dialer6.SetMultipathTCP(true)
 	}
 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
