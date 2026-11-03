@@ -189,10 +189,20 @@ func TestReplayFinalBytesBeforeFIN(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("logical close hung")
 	}
+	// A FIN from the client ends the server's receive side but must not
+	// destroy the entire logical session, which may still send a reply.
+	eof := make(chan error, 1)
+	go func() { var one [1]byte; _, err := server.Read(one[:]); eof <- err }()
 	select {
-	case <-s.ctx.Done():
+	case err := <-eof:
+		if err != io.EOF {
+			t.Fatalf("expected EOF after FIN, got %v", err)
+		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("FIN not received after final ACK")
+		t.Fatal("application read did not see FIN as EOF")
+	}
+	if s.ctx.Err() != nil {
+		t.Fatal("FIN closed whole logical session")
 	}
 }
 
@@ -291,5 +301,105 @@ func TestReplayCloseDuringBlockedUplink(t *testing.T) {
 	}
 	if got := s.ackOffset(); got != uint64(len("pending")) {
 		t.Fatalf("partial/incorrect retired ACK: %d", got)
+	}
+}
+
+// A resumed physical connection begins with sent=0, but the session may
+// already have cumulatively ACKed its entire final payload on a previous
+// connection. FIN must carry that cumulative offset, not the local per-attempt
+// sent cursor (zero), or the receiver rejects it as a sequence gap.
+func TestReplayFINAfterFullyAckedResume(t *testing.T) {
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	const response = "prior-response"
+	if err := s.tx.put(context.Background(), []byte(response)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.tx.ack(uint64(len(response))); err != nil {
+		t.Fatal(err)
+	}
+	s.tx.done()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	var wire bytes.Buffer
+	_ = s.sendFrames(ctx, &wire, func() error { return nil })
+	sawFIN := false
+	for wire.Len() > 0 {
+		frame, err := readReplayFrame(&wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.kind == frameFin {
+			sawFIN = true
+			if frame.offset != uint64(len(response)) {
+				t.Fatalf("resumed FIN offset=%d, want %d", frame.offset, len(response))
+			}
+		}
+	}
+	if !sawFIN {
+		t.Fatal("FIN was not sent")
+	}
+}
+
+// A peer FIN terminates only its upload; its response may still be queued
+// in the opposite direction. The logical session must stay alive.
+func TestReplayPeerFINDoesNotAbortResponse(t *testing.T) {
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	if err := s.tx.put(context.Background(), []byte("pending-response")); err != nil {
+		t.Fatal(err)
+	}
+	var fin bytes.Buffer
+	if err := writeReplayFrame(&fin, replayFrame{kind: frameFin, offset: 0}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.recvFrames(&fin)
+	if s.ctx.Err() != nil {
+		t.Fatal("peer FIN canceled pending response")
+	}
+}
+
+// A complete two-direction exchange must deliver the response after upload EOF.
+// The physical transport is an in-memory full-duplex pipe, so this tests the
+// Replay sequence and logical EOF behavior without TCP/Reality variables.
+func TestReplayHalfCloseDeliversResponse(t *testing.T) {
+	c := newReliableSession(context.Background())
+	defer c.Close()
+	s := newReliableSession(context.Background())
+	defer s.Close()
+	x, y := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go c.connectReplayFrames(ctx, x)
+	go s.connectReplayFrames(ctx, y)
+	client, server := c.conn(), s.conn()
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := c.tx.put(ctx, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	c.tx.done()
+	var req [4]byte
+	if _, err := io.ReadFull(server, req[:]); err != nil {
+		t.Fatalf("server upload: %v", err)
+	}
+	if string(req[:]) != "ping" {
+		t.Fatalf("request=%q", req)
+	}
+	var one [1]byte
+	if _, err := server.Read(one[:]); err != io.EOF {
+		t.Fatalf("expected upload EOF, got %v", err)
+	}
+	sendDone := make(chan error, 1)
+	go func() { _, err := server.Write([]byte("pong")); _ = server.Close(); sendDone <- err }()
+	var reply [4]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil {
+		t.Fatalf("client download: %v", err)
+	}
+	if string(reply[:]) != "pong" {
+		t.Fatalf("response=%q", reply)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("server reply write: %v", err)
 	}
 }

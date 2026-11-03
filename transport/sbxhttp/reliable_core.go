@@ -108,10 +108,15 @@ func (q *replayBuffer) sliceAt(n uint64) (uint64, []byte) {
 	data := append([]byte(nil), q.data[int(n-q.start):int(n-q.start)+count]...)
 	return n, data
 }
-func (q *replayBuffer) eofAndDrained() bool {
+
+// eofAndDrainedOffset returns the cumulative acknowledged byte offset only
+// when the sender has reached EOF and all buffered bytes are acknowledged.
+// Both values must be read under the same lock: on a resumed H2 stream,
+// sent starts at zero even when an earlier attachment advanced q.start.
+func (q *replayBuffer) eofAndDrainedOffset() (uint64, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.eof && len(q.data) == 0
+	return q.start, q.eof && len(q.data) == 0
 }
 func (q *replayBuffer) pending() int { q.mu.Lock(); defer q.mu.Unlock(); return len(q.data) }
 
@@ -188,6 +193,7 @@ type reliableSession struct {
 	ackChanged     chan struct{}
 	closed         atomic.Bool
 	appFinished    atomic.Bool // upper VLESS handler completed; late uplink must not abort downlink
+	remoteFin      atomic.Bool // peer ended only its send direction; local downlink may still be pending
 	closeOnce      sync.Once
 	finishOnce     sync.Once
 	lastDetached   atomic.Int64
@@ -213,7 +219,27 @@ type reliableAppConn struct {
 	s *reliableSession
 }
 
-func (c *reliableAppConn) Close() error                   { c.s.finishApp(); return nil }
+func (c *reliableAppConn) Close() error { c.s.finishApp(); return nil }
+
+// net.Pipe has no CloseWrite. When the remote Replay stream ends, unblock
+// application reads as EOF without closing the opposite (write) direction.
+func (c *reliableAppConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil && c.s.remoteFin.Load() {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return n, io.EOF
+		}
+	}
+	return n, err
+}
+
+func (c *reliableAppConn) SetReadDeadline(t time.Time) error {
+	if c.s.remoteFin.Load() {
+		return c.Conn.SetReadDeadline(time.Now())
+	}
+	return c.Conn.SetReadDeadline(t)
+}
 func (*reliableAppConn) NeedAdditionalReadDeadline() bool { return true }
 
 // Complete the VLESS application side without discarding bytes already
@@ -349,8 +375,15 @@ func (s *reliableSession) recvFrames(r io.Reader) error {
 			if f.offset != s.ackOffset() {
 				return errSequenceGap
 			}
-			s.Close()
-			return io.EOF
+			// FIN terminates only the peer's send half, not the whole
+			// logical connection: our response may still be in flight.
+			if s.remoteFin.CompareAndSwap(false, true) {
+				_ = s.app.SetReadDeadline(time.Now())
+				select {
+				case s.ackChanged <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -391,14 +424,20 @@ func (s *reliableSession) sendFrames(ctx context.Context, w io.Writer, flush fun
 			sent = pos + uint64(len(chunk))
 			continue
 		}
-		if !finSent && s.tx.eofAndDrained() {
-			if err := writeReplayFrame(w, replayFrame{kind: frameFin, offset: sent}); err != nil {
+		finOffset, drained := s.tx.eofAndDrainedOffset()
+		if !finSent && drained {
+			if err := writeReplayFrame(w, replayFrame{kind: frameFin, offset: finOffset}); err != nil {
 				return err
 			}
 			if err := flush(); err != nil {
 				return err
 			}
 			finSent = true
+		}
+		// Once both streams have ended, the physical H2 attachment can
+		// complete. Never return just because the peer's FIN arrived.
+		if finSent && s.remoteFin.Load() {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
