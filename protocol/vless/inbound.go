@@ -81,6 +81,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			}
 		}
 	}
+	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
+		// Pairs with the client-side runtime config audit without exposing keys.
+		logger.Info("sbxhttp: VLESS inbound settings replay_v2=", options.Transport.SBXHTTPOptions.Reliable,
+			" vless_enc=", options.Decryption != "" && options.Decryption != "none")
+	}
 	if options.Decryption != "" && options.Decryption != "none" {
 		if options.Transport == nil || options.Transport.Type != C.V2RayTransportTypeSBXHTTP {
 			return nil, E.New("experimental decryption requires private SB-XHTTP")

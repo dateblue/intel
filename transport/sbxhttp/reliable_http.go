@@ -41,6 +41,25 @@ func validSessionID(id string) bool {
 	return err == nil
 }
 
+// newReliableRequest is the single wire-level constructor for Replay v2.
+// Keeping both required headers in one place makes it straightforward to test
+// the *actual* request path rather than a hand-written fixture.
+func newReliableRequest(ctx context.Context, addr, path, authority, id string, body io.ReadCloser) *http.Request {
+	target := url.URL{Scheme: "https", Host: addr, Path: path}
+	req := (&http.Request{
+		Method: http.MethodPost, URL: &target, Header: make(http.Header),
+		Body: body, ContentLength: -1,
+	}).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Cache-Control", "no-store")
+	req.Header.Set("X-SBXHTTP-Version", reliableVersion)
+	req.Header.Set("X-SBXHTTP-Session", id)
+	if authority != "" {
+		req.Host = authority
+	}
+	return req
+}
+
 // runReliableClient holds the *logical* VLESS stream while swapping physical
 // H2+Reality sockets. It is started once per VLESS dial.
 func (c *Client) runReliableClient(sess *reliableSession, id string, ready chan<- error) {
@@ -108,14 +127,9 @@ func (c *Client) reliableAttempt(sess *reliableSession, id string, established f
 	bodyReader, bodyWriter := io.Pipe()
 	defer bodyReader.Close()
 	defer bodyWriter.Close()
-	target := url.URL{Scheme: "https", Host: c.serverAddr.String(), Path: c.target.Path}
-	req := (&http.Request{Method: http.MethodPost, URL: &target, Header: make(http.Header), Body: bodyReader, ContentLength: -1}).WithContext(attemptCtx)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Cache-Control", "no-store")
-	req.Header.Set("X-SBXHTTP-Version", reliableVersion)
-	req.Header.Set("X-SBXHTTP-Session", id)
-	if name := c.config.ServerName(); name != "" {
-		req.Host = name
+	req := newReliableRequest(attemptCtx, c.serverAddr.String(), c.target.Path, c.config.ServerName(), id, bodyReader)
+	if c.logger != nil {
+		c.logger.Debug("sbxhttp: sending Replay v2 HTTP/2 request session=", id[:8], " version=", req.Header.Get("X-SBXHTTP-Version"))
 	}
 	var mu sync.Mutex
 	var physical net.Conn
@@ -233,7 +247,14 @@ func (s *Server) reliableHandlerDone(id string, sess *reliableSession) {
 }
 func (s *Server) reliableAttach(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-SBXHTTP-Version") != reliableVersion {
-		s.logger.Debug("sbxhttp: reject reliable version remote=", r.RemoteAddr, " version=", r.Header.Get("X-SBXHTTP-Version"))
+		// Version and session ID are sent together by the v2 client.
+		// Missing *both* is strong evidence of a legacy-v1 request or a
+		// wrong/old client binary; if only version is missing, investigate
+		// HTTP/2 header handling. Do not silently downgrade replay to v1.
+		s.logger.Debug("sbxhttp: reject Replay v2 request remote=", r.RemoteAddr,
+			" version=", fmt.Sprintf("%q", r.Header.Get("X-SBXHTTP-Version")),
+			" session_header_present=", r.Header.Get("X-SBXHTTP-Session") != "")
+		w.Header().Set("X-SBXHTTP-Version", reliableVersion)
 		http.Error(w, "SB-XHTTP v2 required", http.StatusUpgradeRequired)
 		return
 	}

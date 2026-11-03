@@ -81,6 +81,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			return nil, E.New("sbxhttp outbound does not support multiplex")
 		}
 	}
+	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
+		// Runtime config audit: an old client silently using legacy-v1 cannot
+		// interoperate with a Replay-v2-only KR server. Never log key material.
+		logger.Info("sbxhttp: VLESS outbound settings replay_v2=", options.Transport.SBXHTTPOptions.Reliable,
+			" vless_enc=", options.Encryption != "" && options.Encryption != "none", " flow=", options.Flow)
+	}
 	if options.Encryption != "" && options.Encryption != "none" && (options.Transport == nil || options.Transport.Type != C.V2RayTransportTypeSBXHTTP) {
 		return nil, E.New("experimental VLESS encryption currently requires private SB-XHTTP")
 	}

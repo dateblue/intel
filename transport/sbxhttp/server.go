@@ -52,6 +52,11 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 		return nil, err
 	}
 	config.SetNextProtos([]string{http2.NextProtoTLS})
+	if options.Reliable {
+		log.Info("sbxhttp: server initialized mode=Replay-v2 path=", path, " required_version=", reliableVersion)
+	} else {
+		log.Info("sbxhttp: server initialized mode=legacy-v1 path=", path)
+	}
 	var visionConfig *stdtls.Config
 	if options.VisionInnerTLS {
 		visionConfig, err = newPrivateVisionServerTLS()

@@ -62,7 +62,18 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 
 // SetLogger attaches the owning VLESS outbound logger without modifying the
 // generic V2Ray transport constructor API used by other protocols.
-func (c *Client) SetLogger(log logger.ContextLogger) { c.logger = log }
+func (c *Client) SetLogger(log logger.ContextLogger) {
+	c.logger = log
+	if log == nil {
+		return
+	}
+	if c.reliable {
+		log.Info("sbxhttp: client initialized mode=Replay-v2 path=", c.target.Path, " version=", reliableVersion)
+	} else {
+		log.Warn("sbxhttp: client initialized mode=legacy-v1 path=", c.target.Path,
+			" (does NOT send X-SBXHTTP-Version; incompatible with Replay-v2-only server)")
+	}
+}
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	if c.reliable {
