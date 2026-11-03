@@ -85,6 +85,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		// Runtime config audit: an old client silently using legacy-v1 cannot
 		// interoperate with a Replay-v2-only KR server. Never log key material.
 		logger.Info("sbxhttp: VLESS outbound settings replay_v2=", options.Transport.SBXHTTPOptions.Reliable,
+			" vision_inner_tls=", options.Transport.SBXHTTPOptions.VisionInnerTLS,
 			" vless_enc=", options.Encryption != "" && options.Encryption != "none", " flow=", options.Flow)
 	}
 	if options.Encryption != "" && options.Encryption != "none" && (options.Transport == nil || options.Transport.Type != C.V2RayTransportTypeSBXHTTP) {

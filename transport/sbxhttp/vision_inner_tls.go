@@ -20,7 +20,10 @@ import (
 	"time"
 )
 
-const privateVisionInnerALPN = "sbxhttp-vision/1"
+const (
+	privateVisionInnerALPN        = "sbxhttp-vision/1"
+	privateVisionHandshakeTimeout = 10 * time.Second
+)
 
 func newPrivateVisionServerTLS() (*stdtls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -62,7 +65,9 @@ func privateVisionClientTLS(ctx context.Context, raw net.Conn) (net.Conn, error)
 		InsecureSkipVerify: true, // Only safe inside mandatory authenticated REALITY.
 		NextProtos:         []string{privateVisionInnerALPN},
 	})
-	if err := inner.HandshakeContext(ctx); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, privateVisionHandshakeTimeout)
+	defer cancel()
+	if err := inner.HandshakeContext(handshakeCtx); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}
@@ -80,7 +85,9 @@ func privateVisionServerTLS(ctx context.Context, raw net.Conn, config *stdtls.Co
 		return nil, errors.New("sbxhttp: private Vision server config missing")
 	}
 	inner := stdtls.Server(raw, config)
-	if err := inner.HandshakeContext(ctx); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, privateVisionHandshakeTimeout)
+	defer cancel()
+	if err := inner.HandshakeContext(handshakeCtx); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}

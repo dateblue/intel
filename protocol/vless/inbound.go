@@ -84,6 +84,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
 		// Pairs with the client-side runtime config audit without exposing keys.
 		logger.Info("sbxhttp: VLESS inbound settings replay_v2=", options.Transport.SBXHTTPOptions.Reliable,
+			" vision_inner_tls=", options.Transport.SBXHTTPOptions.VisionInnerTLS,
 			" vless_enc=", options.Decryption != "" && options.Decryption != "none")
 	}
 	if options.Decryption != "" && options.Decryption != "none" {

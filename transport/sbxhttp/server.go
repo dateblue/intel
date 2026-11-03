@@ -47,6 +47,9 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	if config == nil {
 		return nil, errors.New("sbxhttp: Reality TLS is required")
 	}
+	if err := validatePrivateVisionMode(options.VisionInnerTLS, options.Reliable); err != nil {
+		return nil, err
+	}
 	path, err := cleanPath(options.Path)
 	if err != nil {
 		return nil, err
@@ -55,7 +58,8 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	if options.Reliable {
 		log.Info("sbxhttp: server initialized mode=Replay-v2 path=", path, " required_version=", reliableVersion)
 	} else {
-		log.Info("sbxhttp: server initialized mode=legacy-v1 path=", path)
+		log.Info("sbxhttp: server initialized mode=legacy-v1 path=", path,
+			" vision_inner_tls=", options.VisionInnerTLS)
 	}
 	var visionConfig *stdtls.Config
 	if options.VisionInnerTLS {
@@ -153,6 +157,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if !privateVisionModeHeaderMatches(s.visionInnerTLS, r.Header.Get(privateVisionModeHeader)) {
+		s.logger.Debug("sbxhttp: reject incompatible private Vision mode remote=", r.RemoteAddr,
+			" server_enabled=", s.visionInnerTLS,
+			" client_mode=", r.Header.Get(privateVisionModeHeader))
+		http.Error(w, "SB-XHTTP Vision mode mismatch", http.StatusUpgradeRequired)
+		return
+	}
 	if s.reliable {
 		s.reliableAttach(w, r)
 		return
@@ -186,6 +197,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		app = wrapped
+		s.logger.Debug("sbxhttp: private Vision TLS 1.3 ready remote=", r.RemoteAddr)
 	}
 	s.handler.NewConnectionEx(ctx, app, source, M.Socksaddr{}, N.OnceClose(func(error) { close(done) }))
 	select {

@@ -49,6 +49,9 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	if config == nil {
 		return nil, errors.New("sbxhttp: Reality TLS is required")
 	}
+	if err := validatePrivateVisionMode(opts.VisionInnerTLS, opts.Reliable); err != nil {
+		return nil, err
+	}
 	path, err := cleanPath(opts.Path)
 	if err != nil {
 		return nil, err
@@ -71,6 +74,7 @@ func (c *Client) SetLogger(log logger.ContextLogger) {
 		log.Info("sbxhttp: client initialized mode=Replay-v2 path=", c.target.Path, " version=", reliableVersion)
 	} else {
 		log.Warn("sbxhttp: client initialized mode=legacy-v1 path=", c.target.Path,
+			" vision_inner_tls=", c.visionInnerTLS,
 			" (does NOT send X-SBXHTTP-Version; incompatible with Replay-v2-only server)")
 	}
 }
@@ -113,6 +117,9 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	req := (&http.Request{Method: http.MethodPost, URL: &c.target, Header: make(http.Header), Body: pr, ContentLength: -1}).WithContext(requestCtx)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Cache-Control", "no-store")
+	if c.visionInnerTLS {
+		req.Header.Set(privateVisionModeHeader, privateVisionModeTLS13)
+	}
 	// For consistency with Reality disguise, the HTTP/2 :authority is the SNI.
 	if name := c.config.ServerName(); name != "" {
 		req.Host = name
@@ -169,7 +176,17 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		<-requestCtx.Done()
 	}()
 	if c.visionInnerTLS {
-		return privateVisionClientTLS(ctx, conn)
+		wrapper, err := privateVisionClientTLS(ctx, conn)
+		if err != nil {
+			if c.logger != nil {
+				c.logger.Debug("sbxhttp: private Vision TLS 1.3 handshake failed: ", err)
+			}
+			return nil, err
+		}
+		if c.logger != nil {
+			c.logger.Debug("sbxhttp: private Vision TLS 1.3 ready (HTTP/2 logical carrier)")
+		}
+		return wrapper, nil
 	}
 	return conn, nil
 }
