@@ -90,13 +90,8 @@ for path, marker in [
     ("common/tls/reality_client.go", "X25519MLKEM768"),
     ("common/tls/utls_randomized_lx.go", "X25519MLKEM768"),
     ("common/tls/utls_client.go", "lxRandomFingerprints()"),
-    ("option/tun.go", "SniffOverrideDestination"),
-    ("option/inbound.go", "SniffOverrideDestination"),
-    ("adapter/inbound.go", "SniffOverrideDestination"),
-    ("route/route.go", "metadata.SniffOverrideDestination"),
-    ("protocol/tun/inbound.go", "sniffOverrideDestination"),
 ]:
-    check(marker in source(path), f"PQC/sniff override hook absent: {path}: {marker}")
+    check(marker in source(path), f"PQC Slim feature absent: {path}: {marker}")
 
 for tag in ["with_quic", "with_utls", "with_naive_outbound", "with_clash_api"]:
     check(tag in workflow, f"CLI tag missing: {tag}")
@@ -106,9 +101,15 @@ for tag in ["with_wireguard", "with_openvpn", "with_openconnect", "with_usbip", 
     check(tag not in shared_line, f"unwanted libbox shared tag: {tag}")
 check("go-version: '1.27.3'" in workflow, "CI is not pinned to user's Go 1.27.3")
 
+for path, marker in [
+    ("option/tun.go", 'SniffOverrideDestination bool `json:"sniff_override_destination'),
+    ("route/route.go", "metadata.SniffOverrideDestination"),
+    ("protocol/tun/inbound.go", "sniffOverrideDestination"),
+]:
+    check(marker not in source(path), f"deprecated custom sniff shim remains: {path}")
 if errors:
     print("FAIL: PQC slim source/profile consistency")
     for error in errors:
         print("  -", error)
     sys.exit(1)
-print("PASS: PQC Slim + private SB-XHTTP in/out; legacy Xray XHTTP absent")
+print("PASS: PQC Slim + private SB-XHTTP in/out; official sniff route actions restored")

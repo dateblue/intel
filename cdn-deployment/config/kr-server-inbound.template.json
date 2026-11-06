@@ -1,0 +1,28 @@
+{
+  "type": "vless",
+  "tag": "kr-sbxhttp-cdn-in",
+  "listen": "::",
+  "listen_port": 8443,
+  "users": [
+    {
+      "name": "kr-cdn",
+      "uuid": "1d5ae3d9-09e0-4e79-8fe7-cb81146454e7"
+    }
+  ],
+  "decryption": "__VLESS_ENC_SERVER_PRIVATE_SPEC__",
+  "tls": {
+    "enabled": true,
+    "server_name": "kr.xxxw.eu.org",
+    "alpn": [
+      "h2"
+    ],
+    "min_version": "1.2",
+    "certificate_path": "/etc/sing-box/certs/kr-cdn.crt",
+    "key_path": "/etc/sing-box/certs/kr-cdn.key"
+  },
+  "transport": {
+    "type": "sbxhttp",
+    "mode": "cdn",
+    "path": "/sbx-cdn"
+  }
+}

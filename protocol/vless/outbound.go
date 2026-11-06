@@ -57,11 +57,29 @@ type sbxhttpTransportLogger interface {
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
 	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
-		if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
-			return nil, E.New("sbxhttp outbound requires Reality")
+		mode := options.Transport.SBXHTTPOptions.Mode
+		if mode == "cdn" {
+			if options.TLS == nil || !options.TLS.Enabled || (options.TLS.Reality != nil && options.TLS.Reality.Enabled) {
+				return nil, E.New("sbxhttp CDN requires ordinary TLS without Reality")
+			}
+			if options.Transport.SBXHTTPOptions.VisionInnerTLS || options.Transport.SBXHTTPOptions.Reliable {
+				return nil, E.New("sbxhttp CDN uses its own split HTTP/2 transport; vision_inner_tls/reliable are not supported")
+			}
+			if options.Encryption == "" || options.Encryption == "none" {
+				return nil, E.New("sbxhttp CDN requires VLESS Encryption to protect payload across TLS-terminating CDN")
+			}
+		} else if mode == "" {
+			if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
+				return nil, E.New("sbxhttp outbound requires Reality")
+			}
+		} else {
+			return nil, E.New("sbxhttp unknown mode: ", mode)
 		}
 		// Supported experimental Vision path: authenticated VLESS Encryption.
 		// Refuse combining legacy inner TLS with the real encryption layer.
+		if options.Transport.SBXHTTPOptions.Mode == "cdn" && options.Flow != "" {
+			return nil, E.New("sbxhttp CDN VLESS ENC requires empty flow")
+		}
 		if options.Encryption != "" && options.Encryption != "none" {
 			if options.Transport.SBXHTTPOptions.VisionInnerTLS {
 				return nil, E.New("sbxhttp VLESS encryption and vision_inner_tls are mutually exclusive")

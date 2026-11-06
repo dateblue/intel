@@ -91,6 +91,7 @@ func (o V2RayTransportOptions) DescribeSchema(builder schema.Builder) (*schema.N
 // SBXHTTP is a private sing-box-to-sing-box tunnel; not Xray-compatible.
 // All connection management settings are deliberately internal.
 type V2RaySBXHTTPOptions struct {
+	Mode           string `json:"mode,omitempty"` // "" = original Reality transport; "cdn" = standard TLS split H2 uplink/downlink
 	Path           string `json:"path,omitempty"`
 	Reliable       bool   `json:"reliable,omitempty"`         // experimental v2 replay protocol; both ends must enable
 	VisionInnerTLS bool   `json:"vision_inner_tls,omitempty"` // private SB-to-SB only; carries native Vision over H2

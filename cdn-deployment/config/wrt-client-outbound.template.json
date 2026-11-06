@@ -1,0 +1,21 @@
+{
+  "type": "vless",
+  "tag": "KR-SBXHTTP-CDN",
+  "server": "kr.xxxw.eu.org",
+  "server_port": 8443,
+  "uuid": "1d5ae3d9-09e0-4e79-8fe7-cb81146454e7",
+  "encryption": "__VLESS_ENC_CLIENT_PUBLIC_SPEC__",
+  "tls": {
+    "enabled": true,
+    "server_name": "kr.xxxw.eu.org",
+    "alpn": [
+      "h2"
+    ],
+    "insecure": false
+  },
+  "transport": {
+    "type": "sbxhttp",
+    "mode": "cdn",
+    "path": "/sbx-cdn"
+  }
+}

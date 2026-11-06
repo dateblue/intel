@@ -57,13 +57,31 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		users:   options.Users,
 	}
 	if options.Transport != nil && options.Transport.Type == C.V2RayTransportTypeSBXHTTP {
-		if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
-			return nil, E.New("sbxhttp inbound requires Reality")
+		mode := options.Transport.SBXHTTPOptions.Mode
+		if mode == "cdn" {
+			if options.TLS == nil || !options.TLS.Enabled || (options.TLS.Reality != nil && options.TLS.Reality.Enabled) {
+				return nil, E.New("sbxhttp CDN requires ordinary TLS without Reality")
+			}
+			if options.Transport.SBXHTTPOptions.VisionInnerTLS || options.Transport.SBXHTTPOptions.Reliable {
+				return nil, E.New("sbxhttp CDN uses its own split HTTP/2 transport; vision_inner_tls/reliable are not supported")
+			}
+			if options.Decryption == "" || options.Decryption == "none" {
+				return nil, E.New("sbxhttp CDN requires VLESS Encryption to protect payload across TLS-terminating CDN")
+			}
+		} else if mode == "" {
+			if options.TLS == nil || options.TLS.Reality == nil || !options.TLS.Enabled || !options.TLS.Reality.Enabled {
+				return nil, E.New("sbxhttp inbound requires Reality")
+			}
+		} else {
+			return nil, E.New("sbxhttp unknown mode: ", mode)
 		}
 		if common.PtrValueOrDefault(options.Multiplex).Enabled {
 			return nil, E.New("sbxhttp inbound does not support multiplex")
 		}
 		for _, user := range options.Users {
+			if options.Transport.SBXHTTPOptions.Mode == "cdn" && user.Flow != "" {
+				return nil, E.New("sbxhttp CDN VLESS ENC requires empty user flow")
+			}
 			if options.Decryption != "" && options.Decryption != "none" {
 				if options.Transport.SBXHTTPOptions.VisionInnerTLS {
 					return nil, E.New("sbxhttp decryption conflicts with vision_inner_tls")

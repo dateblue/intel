@@ -4,6 +4,7 @@ import (
 	"context"
 	stdtls "crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -40,12 +41,18 @@ type Server struct {
 	privateVisionTLS *stdtls.Config
 	reliableSessions map[string]*reliableSession
 	reliableStop     chan struct{}
+	cdnMode          bool
+	cdnMu            sync.Mutex
+	cdnSessions      map[string]*cdnServerSession
 	slots            chan struct{}
 }
 
 func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2RaySBXHTTPOptions, config tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (adapter.V2RayServerTransport, error) {
 	if config == nil {
-		return nil, errors.New("sbxhttp: Reality TLS is required")
+		return nil, errors.New("sbxhttp: TLS is required")
+	}
+	if options.Mode != "" && options.Mode != "cdn" {
+		return nil, fmt.Errorf("sbxhttp: unknown transport mode %q", options.Mode)
 	}
 	if err := validatePrivateVisionMode(options.VisionInnerTLS, options.Reliable); err != nil {
 		return nil, err
@@ -55,7 +62,9 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 		return nil, err
 	}
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	if options.Reliable {
+	if options.Mode == "cdn" {
+		log.Info("sbxhttp: server initialized mode=CDN-TLS-splitH2-v1 path=", path)
+	} else if options.Reliable {
 		log.Info("sbxhttp: server initialized mode=Replay-v2 path=", path, " required_version=", reliableVersion)
 	} else {
 		log.Info("sbxhttp: server initialized mode=legacy-v1 path=", path,
@@ -68,7 +77,7 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 			return nil, err
 		}
 	}
-	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{})}, nil
+	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{}), cdnMode: options.Mode == "cdn", cdnSessions: make(map[string]*cdnServerSession)}, nil
 }
 func (s *Server) Network() []string                { return []string{N.NetworkTCP} }
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
@@ -127,7 +136,7 @@ func (s *Server) serveOne(raw net.Conn) {
 	conn, err := tls.ServerHandshake(handshakeCtx, raw, s.tlsConfig)
 	cancelHandshake()
 	if err != nil {
-		s.logger.Debug("sbxhttp: Reality handshake: ", err)
+		s.logger.Debug("sbxhttp: TLS handshake: ", err)
 		return
 	}
 	defer conn.Close()
@@ -137,7 +146,7 @@ func (s *Server) serveOne(raw net.Conn) {
 	// both peers explicitly speak HTTP/2, so an absent ALPN is permitted.
 	// A positive negotiation of another protocol must still be rejected.
 	negotiated := conn.ConnectionState().NegotiatedProtocol
-	if !privateH2ALPNAllowed(negotiated) {
+	if (s.cdnMode && negotiated != http2.NextProtoTLS) || (!s.cdnMode && !privateH2ALPNAllowed(negotiated)) {
 		s.logger.Warn("sbxhttp: reject negotiated ALPN ", negotiated, " (expected h2)")
 		return
 	}
@@ -145,6 +154,9 @@ func (s *Server) serveOne(raw net.Conn) {
 		s.logger.Debug("sbxhttp: Reality handshake verified; ALPN absent, using private HTTP/2 framing")
 	}
 	h2 := newH2Server()
+	if s.cdnMode {
+		h2.MaxConcurrentStreams = 128 // CDN splits GET downstream and POST upstream
+	}
 	h2.ServeConn(conn, &http2.ServeConnOpts{
 		Context:    ctx,
 		Handler:    http.HandlerFunc(s.serveHTTP),
@@ -152,6 +164,10 @@ func (s *Server) serveOne(raw net.Conn) {
 	})
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.cdnMode {
+		s.serveCDNHTTP(w, r)
+		return
+	}
 	if r.ProtoMajor != 2 || r.Method != http.MethodPost || r.URL.Path != s.path {
 		s.logger.Debug("sbxhttp: reject HTTP request remote=", r.RemoteAddr, " proto=", r.Proto, " method=", r.Method, " path=", r.URL.Path)
 		http.Error(w, "not found", http.StatusNotFound)
@@ -213,6 +229,7 @@ func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	s.cdnCloseAll()
 	if s.reliableStop != nil {
 		close(s.reliableStop)
 	}

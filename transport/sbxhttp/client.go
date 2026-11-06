@@ -43,11 +43,16 @@ type Client struct {
 	logger           logger.ContextLogger
 	visionInnerTLS   bool
 	reliableSessions map[*reliableSession]struct{}
+	cdnMode          bool
+	cdnSessions      map[*cdnClientConn]struct{}
 }
 
 func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts option.V2RaySBXHTTPOptions, config tls.Config) (adapter.V2RayClientTransport, error) {
 	if config == nil {
-		return nil, errors.New("sbxhttp: Reality TLS is required")
+		return nil, errors.New("sbxhttp: TLS is required")
+	}
+	if opts.Mode != "" && opts.Mode != "cdn" {
+		return nil, fmt.Errorf("sbxhttp: unknown transport mode %q", opts.Mode)
 	}
 	if err := validatePrivateVisionMode(opts.VisionInnerTLS, opts.Reliable); err != nil {
 		return nil, err
@@ -58,7 +63,7 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	}
 	// Explicit h2-only ALPN. Reality/uTLS is negotiated by sing-box's TLS stack.
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	c := &Client{serverAddr: serverAddr, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{})}
+	c := &Client{serverAddr: serverAddr, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{})}
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }
@@ -70,7 +75,9 @@ func (c *Client) SetLogger(log logger.ContextLogger) {
 	if log == nil {
 		return
 	}
-	if c.reliable {
+	if c.cdnMode {
+		log.Info("sbxhttp: client initialized mode=CDN-TLS-splitH2-v1 path=", c.target.Path)
+	} else if c.reliable {
 		log.Info("sbxhttp: client initialized mode=Replay-v2 path=", c.target.Path, " version=", reliableVersion)
 	} else {
 		log.Warn("sbxhttp: client initialized mode=legacy-v1 path=", c.target.Path,
@@ -80,6 +87,9 @@ func (c *Client) SetLogger(log logger.ContextLogger) {
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+	if c.cdnMode {
+		return c.dialCDN(ctx)
+	}
 	if c.reliable {
 		stream, err := c.dialReliable(ctx)
 		if err != nil || !c.visionInnerTLS {
@@ -214,6 +224,7 @@ func (c *Client) Reset() {
 	for _, s := range sessions {
 		_ = s.Close()
 	}
+	c.cdnReset()
 	for _, s := range reliable {
 		if c.reliable && !c.closed.Load() {
 			s.resetPhysical()
