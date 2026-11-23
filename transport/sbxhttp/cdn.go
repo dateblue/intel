@@ -94,25 +94,65 @@ func cdnValidID(id string) bool {
 	return err == nil
 }
 
-// A separate H2 transport is deliberately owned by each logical VLESS
-// session. It can multiplex GET/POST without sharing fate with other sessions.
+// Each logical VLESS session owns one H2 or H3 transport.
+// This caps cross-session head-of-line amplification and QUIC stream use.
 type cdnClientConn struct {
-	parent       *Client
-	ctx          context.Context
-	cancel       context.CancelFunc
-	tr           *http2.Transport
-	uploadReader *io.PipeReader
-	uploadWriter *io.PipeWriter
-	download     io.ReadCloser
-	mu           sync.Mutex
-	sockets      []net.Conn
-	closed       atomic.Bool
-	closeOnce    sync.Once
-	readMu       sync.Mutex
-	pending      []byte
+	parent         *Client
+	ctx            context.Context
+	cancel         context.CancelFunc
+	tr             cdnRoundTripper
+	closeTransport func()
+	protoMajor     int
+	uploadReader   *io.PipeReader
+	uploadWriter   *io.PipeWriter
+	download       io.ReadCloser
+	mu             sync.Mutex
+	sockets        []net.Conn
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	readMu         sync.Mutex
+	pending        []byte
+}
+
+// cdnRoundTripper is implemented by both the existing HTTP/2 and optional
+// HTTP/3 transports. The origin always receives HTTP/2 from Cloudflare.
+type cdnRoundTripper interface {
+	RoundTrip(*http.Request) (*http.Response, error)
+	CloseIdleConnections()
 }
 
 func (c *Client) dialCDN(ctx context.Context) (net.Conn, error) {
+	switch c.cdnProtocol {
+	case "", "h2":
+		return c.dialCDNProtocol(ctx, "h2")
+	case "h3":
+		return c.dialCDNProtocol(ctx, "h3")
+	case "auto":
+		// An office that filters UDP/443 must not pay a QUIC timeout on
+		// every new proxy connection. Circuit-break H3 for two minutes.
+		if time.Now().UnixNano() >= c.cdnH3RetryAfter.Load() {
+			h3Ctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+			conn, err := c.dialCDNProtocol(h3Ctx, "h3")
+			cancel() // session owns a detached lifetime after successful dial
+			if err == nil {
+				c.cdnH3RetryAfter.Store(0)
+				return conn, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			c.cdnH3RetryAfter.Store(time.Now().Add(2 * time.Minute).UnixNano())
+			if c.logger != nil {
+				c.logger.Debug("sbxhttp CDN: H3 dial failed; backing off to H2: ", err)
+			}
+		}
+		return c.dialCDNProtocol(ctx, "h2")
+	default:
+		return nil, fmt.Errorf("sbxhttp CDN: unsupported protocol %q", c.cdnProtocol)
+	}
+}
+
+func (c *Client) dialCDNProtocol(ctx context.Context, protocol string) (net.Conn, error) {
 	if c.closed.Load() {
 		return nil, net.ErrClosed
 	}
@@ -127,29 +167,43 @@ func (c *Client) dialCDN(ctx context.Context) (net.Conn, error) {
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	pr, pw := io.Pipe()
 	session := &cdnClientConn{parent: c, ctx: lifetime, cancel: cancel, uploadReader: pr, uploadWriter: pw}
-	session.tr = &http2.Transport{
-		DialTLSContext: func(dialCtx context.Context, _, _ string, _ *tls.STDConfig) (net.Conn, error) {
-			raw, err := c.tlsDialer.DialTLSContext(dialCtx, c.serverAddr)
-			if err != nil {
-				return nil, err
-			}
-			if raw.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
-				_ = raw.Close()
-				return nil, fmt.Errorf("sbxhttp CDN: standard TLS must negotiate h2, got %q", raw.ConnectionState().NegotiatedProtocol)
-			}
-			session.mu.Lock()
-			if session.closed.Load() {
+	if protocol == "h3" {
+		var closeFn func()
+		session.tr, closeFn, err = newCDNH3Transport(c)
+		if err != nil {
+			_ = session.Close()
+			return nil, err
+		}
+		session.closeTransport = closeFn
+		session.protoMajor = 3
+	} else {
+		h2 := &http2.Transport{
+			DialTLSContext: func(dialCtx context.Context, _, _ string, _ *tls.STDConfig) (net.Conn, error) {
+				raw, dialErr := c.tlsDialer.DialTLSContext(dialCtx, c.serverAddr)
+				if dialErr != nil {
+					return nil, dialErr
+				}
+				if raw.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
+					_ = raw.Close()
+					return nil, fmt.Errorf("sbxhttp CDN: standard TLS must negotiate h2, got %q", raw.ConnectionState().NegotiatedProtocol)
+				}
+				session.mu.Lock()
+				if session.closed.Load() {
+					session.mu.Unlock()
+					_ = raw.Close()
+					return nil, net.ErrClosed
+				}
+				session.sockets = append(session.sockets, raw)
 				session.mu.Unlock()
-				_ = raw.Close()
-				return nil, net.ErrClosed
-			}
-			session.sockets = append(session.sockets, raw)
-			session.mu.Unlock()
-			return raw, nil
-		},
-		ReadIdleTimeout:  h2ReadIdleTimeout,
-		PingTimeout:      h2PingTimeout,
-		WriteByteTimeout: h2WriteByteTimeout,
+				return raw, nil
+			},
+			ReadIdleTimeout:  h2ReadIdleTimeout,
+			PingTimeout:      h2PingTimeout,
+			WriteByteTimeout: h2WriteByteTimeout,
+		}
+		session.tr = h2
+		session.closeTransport = h2.CloseIdleConnections
+		session.protoMajor = 2
 	}
 	// Host and SNI must be the Cloudflare-proxied name; never use the origin IP.
 	authority := c.config.ServerName()
@@ -183,7 +237,7 @@ func (c *Client) dialCDN(ctx context.Context) (net.Conn, error) {
 			deliver(result{err: err})
 			return
 		}
-		if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 || resp.Header.Get("X-SBXHTTP-CDN") != cdnWireVersion {
+		if resp.StatusCode != http.StatusOK || resp.ProtoMajor != session.protoMajor || resp.Header.Get("X-SBXHTTP-CDN") != cdnWireVersion {
 			_ = resp.Body.Close()
 			deliver(result{err: fmt.Errorf("sbxhttp CDN downlink rejected: %s", resp.Status)})
 			return
@@ -304,10 +358,25 @@ func (s *cdnClientConn) packetUploader(baseURL, authority string) {
 		}
 	}
 }
+
+// A CDN can deliver the body to origin but lose the 204 acknowledgement.
+// Retries keep the same sequence ID, and the origin ignores duplicates.
+// Only retry transient network / server / reorder errors; do not hammer WAF 403s.
+func cdnRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusConflict, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *cdnClientConn) sendPacket(baseURL, authority string, seq uint64, data []byte) error {
 	packetURL := baseURL + "/" + strconv.FormatUint(seq, 10)
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		if s.ctx.Err() != nil {
 			return s.ctx.Err()
 		}
@@ -325,18 +394,31 @@ func (s *cdnClientConn) sendPacket(baseURL, authority string, seq uint64, data [
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusNoContent && resp.ProtoMajor == 2 {
+			if resp.StatusCode == http.StatusNoContent && resp.ProtoMajor == s.protoMajor {
 				cancel()
 				return nil
 			}
-			err = fmt.Errorf("sbxhttp CDN packet %d rejected: %s", seq, resp.Status)
+			// Authentication/WAF/upgrade errors should surface immediately.
+			if !cdnRetryableStatus(resp.StatusCode) {
+				cancel()
+				return fmt.Errorf("sbxhttp CDN packet %d rejected: %s", seq, resp.Status)
+			}
+			err = fmt.Errorf("sbxhttp CDN packet %d transient response: %s", seq, resp.Status)
 		}
 		last = err
 		cancel()
+		if attempt == 3 {
+			break
+		}
+		// Bounded exponential backoff with deterministic per-sequence offset.
+		// Avoid synchronised bursts on a congested CDN edge.
+		backoff := time.Duration(200*(1<<attempt)+int(seq%7)*13) * time.Millisecond
+		timer := time.NewTimer(backoff)
 		select {
 		case <-s.ctx.Done():
+			timer.Stop()
 			return s.ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
 	return last
@@ -384,7 +466,9 @@ func (s *cdnClientConn) Close() error {
 		for _, conn := range sockets {
 			_ = conn.Close()
 		}
-		s.tr.CloseIdleConnections()
+		if s.closeTransport != nil {
+			s.closeTransport()
+		}
 		s.parent.mu.Lock()
 		delete(s.parent.cdnSessions, s)
 		s.parent.mu.Unlock()
@@ -479,13 +563,17 @@ func (c *cdnServerConn) Write(b []byte) (int, error) {
 		if err := cdnWriteFrame(c.writer, b[:n]); err != nil {
 			return count, err
 		}
-		if err := c.flush(); err != nil {
-			return count, err
-		}
 		b = b[n:]
 		count += n
 	}
-	c.lastWrite = time.Now()
+	// HTTP2 flush once per application Write, rather than once per 32 KiB
+	// frame. No delayed batching: latency-sensitive writes still flush now.
+	if count > 0 {
+		if err := c.flush(); err != nil {
+			return count, err
+		}
+		c.lastWrite = time.Now()
+	}
 	return count, nil
 }
 func (c *cdnServerConn) heartbeat() error {
@@ -560,7 +648,8 @@ func (s *Server) cdnDown(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	pr, pw := io.Pipe()
-	conn := &cdnServerConn{reader: pr, writer: w, flush: func() error { return http.NewResponseController(w).Flush() }, cancel: cancel, lastWrite: time.Now()}
+	controller := http.NewResponseController(w)
+	conn := &cdnServerConn{reader: pr, writer: w, flush: controller.Flush, cancel: cancel, lastWrite: time.Now()}
 	sess := &cdnServerSession{ctx: ctx, cancel: cancel, conn: conn, uploadReader: pr, uploadWriter: pw, pending: make(map[uint64][]byte)}
 	sess.packetCond = sync.NewCond(&sess.packetMu)
 	s.cdnSessions[id] = sess
@@ -572,7 +661,7 @@ func (s *Server) cdnDown(w http.ResponseWriter, r *http.Request, id string) {
 	if _, err := w.Write([]byte(cdnPreamble)); err != nil {
 		return
 	}
-	if err := http.NewResponseController(w).Flush(); err != nil {
+	if err := controller.Flush(); err != nil {
 		return
 	}
 	ticker := time.NewTicker(cdnHeartbeat)

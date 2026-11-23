@@ -33,6 +33,9 @@ var _ adapter.V2RayClientTransport = (*Client)(nil)
 // One call to DialContext == one independent TLS/TCP + HTTP/2 connection.
 type Client struct {
 	serverAddr       M.Socksaddr
+	rawDialer        N.Dialer
+	cdnProtocol      string
+	cdnH3RetryAfter  atomic.Int64
 	tlsDialer        tls.Dialer
 	config           tls.Config
 	target           url.URL
@@ -54,6 +57,12 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	if opts.Mode != "" && opts.Mode != "cdn" {
 		return nil, fmt.Errorf("sbxhttp: unknown transport mode %q", opts.Mode)
 	}
+	if opts.CDNProtocol != "" && opts.Mode != "cdn" {
+		return nil, errors.New("sbxhttp: cdn_protocol is only valid in CDN mode")
+	}
+	if opts.CDNProtocol != "" && opts.CDNProtocol != "h2" && opts.CDNProtocol != "h3" && opts.CDNProtocol != "auto" {
+		return nil, fmt.Errorf("sbxhttp: unsupported cdn_protocol %q", opts.CDNProtocol)
+	}
 	if err := validatePrivateVisionMode(opts.VisionInnerTLS, opts.Reliable); err != nil {
 		return nil, err
 	}
@@ -63,7 +72,7 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	}
 	// Explicit h2-only ALPN. Reality/uTLS is negotiated by sing-box's TLS stack.
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	c := &Client{serverAddr: serverAddr, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{})}
+	c := &Client{serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{})}
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }
@@ -76,7 +85,11 @@ func (c *Client) SetLogger(log logger.ContextLogger) {
 		return
 	}
 	if c.cdnMode {
-		log.Info("sbxhttp: client initialized mode=CDN-TLS-splitH2-v1 path=", c.target.Path)
+		protocol := c.cdnProtocol
+		if protocol == "" {
+			protocol = "h2"
+		}
+		log.Info("sbxhttp: client initialized mode=CDN-TLS-split-v1 protocol=", protocol, " path=", c.target.Path)
 	} else if c.reliable {
 		log.Info("sbxhttp: client initialized mode=Replay-v2 path=", c.target.Path, " version=", reliableVersion)
 	} else {

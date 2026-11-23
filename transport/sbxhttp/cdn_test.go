@@ -99,3 +99,42 @@ func TestCDNPacketReorder(t *testing.T) {
 		t.Fatal("reassembler stalled")
 	}
 }
+
+// H2 downstream performance: avoid flushing to the CDN once per frame.
+func TestCDNDownlinkFlushOncePerWrite(t *testing.T) {
+	var count int
+	recorder := httptest.NewRecorder()
+	conn := &cdnServerConn{writer: recorder, flush: func() error { count++; return nil }}
+	data := bytes.Repeat([]byte{0x42}, 5*cdnMaxFrame+17)
+	if n, err := conn.Write(data); n != len(data) || err != nil {
+		t.Fatalf("write %d/%d: %v", n, len(data), err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 HTTP/2 flush for 6 frames, got %d", count)
+	}
+	var restored []byte
+	r := bytes.NewReader(recorder.Body.Bytes())
+	for r.Len() > 0 {
+		frame, err := cdnReadFrame(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored = append(restored, frame...)
+	}
+	if !bytes.Equal(restored, data) {
+		t.Fatal("downstream bytes corrupted")
+	}
+}
+
+func TestCDNRetryableStatus(t *testing.T) {
+	for _, status := range []int{409, 429, 500, 502, 503, 504} {
+		if !cdnRetryableStatus(status) {
+			t.Fatalf("expected retry on %d", status)
+		}
+	}
+	for _, status := range []int{200, 204, 400, 401, 403, 404, 413} {
+		if cdnRetryableStatus(status) {
+			t.Fatalf("unexpected retry on %d", status)
+		}
+	}
+}
