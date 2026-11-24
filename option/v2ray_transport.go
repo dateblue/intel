@@ -92,8 +92,8 @@ func (o V2RayTransportOptions) DescribeSchema(builder schema.Builder) (*schema.N
 // All connection management settings are deliberately internal.
 type V2RaySBXHTTPOptions struct {
 	CDNProtocol     string   `json:"cdn_protocol,omitempty"`     // CDN client only: h2 (default), h3, auto
-	DownConnections int      `json:"down_connections,omitempty"` // MultiTCP: CDN 1..6 optional lanes; direct 1/2/4; 0=legacy
-	CDNIPs          []string `json:"cdn_ips,omitempty"`          // client-only CDN MultiTCP: per-lane Cloudflare edge IP pool, preserves SNI/Host
+	DownConnections int      `json:"down_connections,omitempty"` // deprecated: non-zero rejected; remove this key from v0.7 configs
+	CDNIPs          []string `json:"cdn_ips,omitempty"`          // deprecated: non-empty rejected; use server to pin a single CDN edge IP
 	Mode            string   `json:"mode,omitempty"`             // "" = original Reality transport; "cdn" = standard TLS split H2 uplink/downlink
 	Path            string   `json:"path,omitempty"`
 	Reliable        bool     `json:"reliable,omitempty"`         // experimental v2 replay protocol; both ends must enable

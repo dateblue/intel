@@ -44,9 +44,6 @@ type Server struct {
 	cdnMode          bool
 	cdnMu            sync.Mutex
 	cdnSessions      map[string]*cdnServerSession
-	multiDown        int
-	multiMu          sync.Mutex
-	multiSessions    map[string]*multiServerSession
 	slots            chan struct{}
 }
 
@@ -57,14 +54,8 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	if options.Mode != "" && options.Mode != "cdn" {
 		return nil, fmt.Errorf("sbxhttp: unknown transport mode %q", options.Mode)
 	}
-	if len(options.CDNIPs) > 0 {
-		return nil, errors.New("sbxhttp: cdn_ips is a CDN client-only option; the server only receives the common session ID")
-	}
-	if options.DownConnections < 0 || options.DownConnections > 6 || (options.Mode != "cdn" && options.DownConnections != 0 && options.DownConnections != 1 && options.DownConnections != 2 && options.DownConnections != 4) {
-		return nil, errors.New("sbxhttp: CDN down_connections must be 0..6; direct supports 0,1,2,4")
-	}
-	if options.DownConnections > 0 && options.Reliable {
-		return nil, errors.New("sbxhttp: MultiTCP cannot combine with Replay-v2")
+	if err := rejectMultiTCPOptions(options.DownConnections, options.CDNIPs); err != nil {
+		return nil, err
 	}
 	if err := validatePrivateVisionMode(options.VisionInnerTLS, options.Reliable); err != nil {
 		return nil, err
@@ -74,9 +65,7 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 		return nil, err
 	}
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	if options.DownConnections > 0 {
-		log.Info("sbxhttp: experimental MultiTCP server mode=", options.Mode, " max_lanes=", options.DownConnections, " path=", path)
-	} else if options.Mode == "cdn" {
+	if options.Mode == "cdn" {
 		log.Info("sbxhttp: server initialized mode=CDN-TLS-splitH2-v1 path=", path)
 	} else if options.Reliable {
 		log.Info("sbxhttp: server initialized mode=Replay-v2 path=", path, " required_version=", reliableVersion)
@@ -91,7 +80,7 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 			return nil, err
 		}
 	}
-	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{}), cdnMode: options.Mode == "cdn", cdnSessions: make(map[string]*cdnServerSession), multiDown: options.DownConnections, multiSessions: make(map[string]*multiServerSession)}, nil
+	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{}), cdnMode: options.Mode == "cdn", cdnSessions: make(map[string]*cdnServerSession)}, nil
 }
 func (s *Server) Network() []string                { return []string{N.NetworkTCP} }
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
@@ -168,7 +157,7 @@ func (s *Server) serveOne(raw net.Conn) {
 		s.logger.Debug("sbxhttp: Reality handshake verified; ALPN absent, using private HTTP/2 framing")
 	}
 	h2 := newH2Server()
-	if s.cdnMode || s.multiDown > 0 {
+	if s.cdnMode {
 		h2.MaxConcurrentStreams = 128 // CDN splits GET downstream and POST upstream
 	}
 	h2.ServeConn(conn, &http2.ServeConnOpts{
@@ -178,10 +167,6 @@ func (s *Server) serveOne(raw net.Conn) {
 	})
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.multiDown > 0 && (r.Header.Get(multiHeader) == multiWireVersion || (s.cdnMode && r.Header.Get(multiHeader) == multiResVersion)) {
-		s.serveMultiHTTP(w, r)
-		return
-	}
 	if s.cdnMode {
 		s.serveCDNHTTP(w, r)
 		return
@@ -248,7 +233,6 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.cdnCloseAll()
-	s.multiCloseAll()
 	if s.reliableStop != nil {
 		close(s.reliableStop)
 	}
