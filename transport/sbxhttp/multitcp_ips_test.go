@@ -18,6 +18,10 @@ func TestMultiCDNIPValidation(t *testing.T) {
 			t.Fatalf("lane %d got %s want %s", i, got[i], want[i])
 		}
 	}
+	six, err := validateMultiCDNIPs([]string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "4.2.2.2", "208.67.222.222", "208.67.220.220"}, true, 1)
+	if err != nil || len(six) != 6 {
+		t.Fatalf("six optional candidates for a single live lane should work: %v", err)
+	}
 	_, err = validateMultiCDNIPs(nil, false, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +34,7 @@ func TestMultiCDNIPValidation(t *testing.T) {
 	}{
 		{[]string{"1.1.1.1"}, false, 4, "not CDN"},
 		{[]string{"1.1.1.1"}, true, 0, "disabled"},
-		{[]string{"1.1.1.1", "8.8.8.8"}, true, 1, "too many"},
+		{[]string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "4.2.2.2", "208.67.222.222", "208.67.220.220", "1.0.0.1"}, true, 6, "more than six"},
 		{[]string{"1.1.1.1", "1.1.1.1"}, true, 2, "duplicate"},
 		{[]string{"127.0.0.1"}, true, 1, "loopback"},
 		{[]string{"192.168.1.1"}, true, 1, "RFC1918"},
