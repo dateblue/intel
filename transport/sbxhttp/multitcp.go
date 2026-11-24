@@ -47,6 +47,7 @@ type multiClientLane struct {
 	streamReader *io.PipeReader
 	streamWriter *io.PipeWriter
 	streamQueue  chan multiFrame
+	rxBytes      atomic.Uint64 // actual downlink payload bytes received from this CF IP
 }
 
 func (l *multiClientLane) close() {
@@ -83,6 +84,7 @@ type multiClientConn struct {
 	streamSpace  chan struct{}
 	closed       atomic.Bool
 	closeOnce    sync.Once
+	delivered    atomic.Uint64 // ordered bytes delivered to the application
 }
 
 func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
@@ -101,65 +103,154 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 	ur, uw := io.Pipe()
 	dr, dw := io.Pipe()
 	m := &multiClientConn{parent: c, ctx: lifetime, cancel: cancel, upReader: ur, upWriter: uw, downReader: dr, downWriter: dw, frames: make(chan multiFrame, 4*c.multiDown), streamSpace: make(chan struct{}, 1)}
-	// In contrast to http2.Transport.RoundTrip, NewClientConn cannot silently
-	// reuse another lane's TCP connection or silently create additional dials.
-	m.lanes = make([]*multiClientLane, 0, c.multiDown)
-	dialCtx, stopDial := context.WithTimeout(ctx, timeout)
-	defer stopDial()
-	for i := 0; i < c.multiDown; i++ {
-		l, err := c.newMultiLane(dialCtx, i)
-		if err != nil {
-			_ = m.Close()
-			return nil, fmt.Errorf("sbxhttp multitcp: lane %d dial: %w", i, err)
-		}
-		m.lanes = append(m.lanes, l)
-		if c.logger != nil {
-			c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", c.multiDown,
-				" local=", l.physical.LocalAddr(), " remote=", l.physical.RemoteAddr(),
-				" independently dialled H2/TCP")
-		}
-		urlValue := url.URL{Scheme: "https", Host: c.serverAddr.String(), Path: strings.TrimRight(c.target.Path, "/") + "/multi/down/" + id + "/" + strconv.Itoa(i)}
-		req, _ := http.NewRequestWithContext(lifetime, http.MethodGet, urlValue.String(), nil)
-		m.setHeaders(req)
-		type result struct {
-			body io.ReadCloser
-			err  error
-		}
-		resultCh := make(chan result, 1)
-		go func(lane *multiClientLane) {
-			resp, err := lane.h2.RoundTrip(req)
+	if !c.cdnMode {
+		// In contrast to http2.Transport.RoundTrip, NewClientConn cannot silently
+		// reuse another lane's TCP connection or silently create additional dials.
+		m.lanes = make([]*multiClientLane, 0, c.multiDown)
+		dialCtx, stopDial := context.WithTimeout(ctx, timeout)
+		defer stopDial()
+		for i := 0; i < c.multiDown; i++ {
+			l, err := c.newMultiLane(dialCtx, i)
 			if err != nil {
-				resultCh <- result{err: err}
-				return
-			}
-			if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || resp.Header.Get(multiHeader) != multiWireVersion {
-				_ = resp.Body.Close()
-				resultCh <- result{err: fmt.Errorf("multi down GET rejected: %s", resp.Status)}
-				return
-			}
-			pre := make([]byte, len(multiPreamble))
-			if _, err := io.ReadFull(resp.Body, pre); err != nil {
-				_ = resp.Body.Close()
-				resultCh <- result{err: err}
-				return
-			}
-			if string(pre) != multiPreamble {
-				_ = resp.Body.Close()
-				resultCh <- result{err: errors.New("multi down bad preamble")}
-				return
-			}
-			resultCh <- result{body: resp.Body}
-		}(l)
-		select {
-		case res := <-resultCh:
-			if res.err != nil {
 				_ = m.Close()
-				return nil, res.err
+				return nil, fmt.Errorf("sbxhttp multitcp: lane %d dial: %w", i, err)
 			}
-			l.body = res.body
-		case <-dialCtx.Done():
+			m.lanes = append(m.lanes, l)
+			if c.logger != nil {
+				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", c.multiDown,
+					" local=", l.physical.LocalAddr(), " remote=", l.physical.RemoteAddr(),
+					" independently dialled H2/TCP")
+			}
+			urlValue := url.URL{Scheme: "https", Host: c.serverAddr.String(), Path: strings.TrimRight(c.target.Path, "/") + "/multi/down/" + id + "/" + strconv.Itoa(i)}
+			req, _ := http.NewRequestWithContext(lifetime, http.MethodGet, urlValue.String(), nil)
+			m.setHeaders(req)
+			type result struct {
+				body io.ReadCloser
+				err  error
+			}
+			resultCh := make(chan result, 1)
+			go func(lane *multiClientLane) {
+				resp, err := lane.h2.RoundTrip(req)
+				if err != nil {
+					resultCh <- result{err: err}
+					return
+				}
+				if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || resp.Header.Get(multiHeader) != multiWireVersion {
+					_ = resp.Body.Close()
+					resultCh <- result{err: fmt.Errorf("multi down GET rejected: %s", resp.Status)}
+					return
+				}
+				pre := make([]byte, len(multiPreamble))
+				if _, err := io.ReadFull(resp.Body, pre); err != nil {
+					_ = resp.Body.Close()
+					resultCh <- result{err: err}
+					return
+				}
+				if string(pre) != multiPreamble {
+					_ = resp.Body.Close()
+					resultCh <- result{err: errors.New("multi down bad preamble")}
+					return
+				}
+				resultCh <- result{body: resp.Body}
+			}(l)
+			select {
+			case res := <-resultCh:
+				if res.err != nil {
+					_ = m.Close()
+					return nil, res.err
+				}
+				l.body = res.body
+			case <-dialCtx.Done():
+				_ = m.Close()
+				return nil, dialCtx.Err()
+			}
+		}
+	} else {
+		// Establish all physical TLS/TCP/H2 lanes concurrently. In v0.2 these
+		// were dialled AND their GET preambles awaited serially, amplifying
+		// latency tests by N handshakes. Each result owns its socket until the
+		// coordinator has collected ALL results (including on errors).
+		m.lanes = make([]*multiClientLane, c.multiDown)
+		dialCtx, stopDial := context.WithTimeout(ctx, timeout)
+		defer stopDial()
+		type laneResult struct {
+			index int
+			lane  *multiClientLane
+			err   error
+		}
+		results := make(chan laneResult, c.multiDown)
+		for i := 0; i < c.multiDown; i++ {
+			go func(index int) {
+				l, err := c.newMultiLane(dialCtx, index)
+				if err != nil {
+					results <- laneResult{index: index, err: err}
+					return
+				}
+				urlValue := url.URL{Scheme: "https", Host: c.serverAddr.String(), Path: strings.TrimRight(c.target.Path, "/") + "/multi/down/" + id + "/" + strconv.Itoa(index)}
+				req, err := http.NewRequestWithContext(lifetime, http.MethodGet, urlValue.String(), nil)
+				if err == nil {
+					m.setHeaders(req)
+					var resp *http.Response
+					resp, err = l.h2.RoundTrip(req)
+					if err == nil {
+						if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || resp.Header.Get(multiHeader) != multiWireVersion {
+							err = fmt.Errorf("multi down GET rejected: %s", resp.Status)
+						} else {
+							pre := make([]byte, len(multiPreamble))
+							_, err = io.ReadFull(resp.Body, pre)
+							if err == nil && string(pre) != multiPreamble {
+								err = errors.New("multi down bad preamble")
+							}
+						}
+						if err != nil {
+							_ = resp.Body.Close()
+						} else {
+							l.body = resp.Body
+						}
+					}
+				}
+				if err != nil {
+					l.close()
+					results <- laneResult{index: index, err: err}
+					return
+				}
+				results <- laneResult{index: index, lane: l}
+			}(i)
+		}
+		var firstErr error
+		for remaining := c.multiDown; remaining > 0; remaining-- {
+			// Timeout cancels the GET context and closes any partially opened H2
+			// connection; we still collect every result so no socket is orphaned.
+			select {
+			case result := <-results:
+				if result.err != nil && firstErr == nil {
+					firstErr = fmt.Errorf("sbxhttp multitcp: lane %d dial: %w", result.index, result.err)
+					m.cancel()
+					stopDial()
+				}
+				m.lanes[result.index] = result.lane
+			case <-dialCtx.Done():
+				if firstErr == nil {
+					firstErr = dialCtx.Err()
+				}
+				m.cancel()
+				stopDial()
+				// Don't count this event as a completed worker. Once contexts are
+				// cancelled, collect their socket-owning results below.
+				result := <-results
+				m.lanes[result.index] = result.lane
+			}
+		}
+		if firstErr != nil {
 			_ = m.Close()
-			return nil, dialCtx.Err()
+			return nil, firstErr
+		}
+		if c.logger != nil {
+			for i, l := range m.lanes {
+				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", c.multiDown,
+					" local=", l.physical.LocalAddr(), " remote=", l.physical.RemoteAddr(),
+					" independently dialled H2/TCP")
+			}
 		}
 	}
 	c.mu.Lock()
@@ -171,6 +262,9 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 	c.multiSessions[m] = struct{}{}
 	c.mu.Unlock()
 	go m.assemble()
+	if c.cdnMode && c.logger != nil {
+		go m.logMultiStats()
+	}
 	for _, l := range m.lanes {
 		go m.downReaderLoop(l)
 	}
@@ -251,6 +345,9 @@ func (m *multiClientConn) downReaderLoop(l *multiClientLane) {
 		if len(f.data) == 0 {
 			continue
 		}
+		if m.parent.cdnMode {
+			l.rxBytes.Add(uint64(len(f.data)))
+		}
 		select {
 		case m.frames <- f:
 		case <-m.ctx.Done():
@@ -278,7 +375,42 @@ func (m *multiClientConn) assemble() {
 					_ = m.Close()
 					return
 				}
+				m.delivered.Add(uint64(len(data)))
 			}
+		}
+	}
+}
+
+// Payload-only telemetry; it distinguishes a connected lane from a lane
+// actually carrying useful download bytes. Reports 10-second rates only for
+// active sessions at debug level; no timer/goroutine survives Close.
+func (m *multiClientConn) logMultiStats() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	previous := make([]uint64, len(m.lanes))
+	var prevDelivered uint64
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			values := make([]string, len(m.lanes))
+			var interval uint64
+			for i, l := range m.lanes {
+				current := l.rxBytes.Load()
+				delta := current - previous[i]
+				previous[i] = current
+				interval += delta
+				values[i] = fmt.Sprintf("lane%d=%s:%.2fMbps", i+1, l.physical.RemoteAddr(), float64(delta)*8/10e6)
+			}
+			delivered := m.delivered.Load()
+			deltaDelivered := delivered - prevDelivered
+			prevDelivered = delivered
+			if interval < 128*1024 && deltaDelivered < 128*1024 {
+				continue
+			}
+			m.parent.logger.Debug("sbxhttp MultiTCP down 10s ", strings.Join(values, " "),
+				" delivered=", fmt.Sprintf("%.2fMbps", float64(deltaDelivered)*8/10e6))
 		}
 	}
 }
@@ -511,7 +643,9 @@ func (m *multiClientConn) Close() error {
 		_ = m.downWriter.CloseWithError(net.ErrClosed)
 		_ = m.downReader.CloseWithError(net.ErrClosed)
 		for _, lane := range m.lanes {
-			lane.close()
+			if lane != nil {
+				lane.close()
+			}
 		}
 		m.parent.mu.Lock()
 		delete(m.parent.multiSessions, m)
@@ -538,7 +672,11 @@ func (*multiClientConn) NeedAdditionalReadDeadline() bool { return true }
 
 // Server-side session is independent of the individual GET request contexts.
 // The first GET creates it; all lanes must join before the VLESS handler starts.
-type multiServerLane struct{ queue chan multiFrame }
+type multiServerLane struct {
+	queue   chan multiFrame
+	pending atomic.Int64 // enqueued + in-flight downlink frames
+	flushNS atomic.Int64 // origin-side H2 Flush EWMA
+}
 type multiServerSession struct {
 	parent         *Server
 	id             string
@@ -650,7 +788,9 @@ func (s *multiServerSession) assembleStream() {
 	}
 }
 
-func (s *multiServerSession) writeDown(b []byte) (int, error) {
+// Keep the established REALITY/direct MultiTCP scheduler bit-for-bit
+// equivalent to v0.2. CDN alone uses the new congestion-sensitive selector.
+func (s *multiServerSession) writeDownRoundRobin(b []byte) (int, error) {
 	s.downWriteMu.Lock()
 	defer s.downWriteMu.Unlock()
 	written := 0
@@ -665,8 +805,6 @@ func (s *multiServerSession) writeDown(b []byte) (int, error) {
 		f := multiFrame{offset: s.nextOffset, data: append([]byte(nil), b[:n]...)}
 		sent := false
 		for !sent {
-			// Non-blocking search avoids one slow lane pinning the whole writer
-			// while other lanes have space. All queues are bounded.
 			for i := 0; i < s.laneCount; i++ {
 				index := (s.nextLane + i) % s.laneCount
 				select {
@@ -686,6 +824,61 @@ func (s *multiServerSession) writeDown(b []byte) (int, error) {
 					return written, net.ErrClosed
 				}
 			}
+		}
+		s.nextOffset += uint64(n)
+		written += n
+		b = b[n:]
+	}
+	return written, nil
+}
+
+func (s *multiServerSession) writeDown(b []byte) (int, error) {
+	if s.parent == nil || !s.parent.cdnMode {
+		return s.writeDownRoundRobin(b)
+	}
+	s.downWriteMu.Lock()
+	defer s.downWriteMu.Unlock()
+	written := 0
+	for len(b) > 0 {
+		if s.ctx.Err() != nil {
+			return written, net.ErrClosed
+		}
+		n := len(b)
+		if n > multiChunk {
+			n = multiChunk
+		}
+		f := multiFrame{offset: s.nextOffset, data: append([]byte(nil), b[:n]...)}
+		for {
+			var load [4]multiLaneLoad // lane count is validated to 1/2/4
+			for i, lane := range s.lanes {
+				load[i] = multiLaneLoad{
+					pending:   lane.pending.Load(),
+					flushNS:   lane.flushNS.Load(),
+					available: len(lane.queue) < cap(lane.queue),
+				}
+			}
+			index := selectMultiLane(load[:s.laneCount], s.nextLane)
+			if index < 0 {
+				select {
+				case <-s.laneSpace:
+				case <-s.ctx.Done():
+					return written, net.ErrClosed
+				}
+				continue
+			}
+			lane := s.lanes[index]
+			lane.pending.Add(1)
+			select {
+			case lane.queue <- f:
+				s.nextLane = (index + 1) % s.laneCount
+			case <-s.ctx.Done():
+				lane.pending.Add(-1)
+				return written, net.ErrClosed
+			default:
+				lane.pending.Add(-1)
+				continue
+			}
+			break
 		}
 		s.nextOffset += uint64(n)
 		written += n
@@ -825,15 +1018,48 @@ func (s *Server) multiDownGET(w http.ResponseWriter, r *http.Request, id string,
 		case <-r.Context().Done():
 			return
 		case f := <-lane.queue:
+			maxBatch := 1
+			if s.cdnMode {
+				maxBatch = 4
+			}
+			// One Flush for up to four already queued frames lowers H2
+			// scheduling overhead without delaying a lone small frame.
+			var start time.Time
+			if s.cdnMode {
+				start = time.Now()
+			}
+			frames := 0
+			for {
+				if err := multiWriteFrame(w, f); err != nil {
+					return
+				}
+				frames++
+				if frames >= maxBatch {
+					break
+				}
+				select {
+				case f = <-lane.queue:
+				default:
+					goto flushed
+				}
+			}
+		flushed:
+			if err := controller.Flush(); err != nil {
+				return
+			}
+			if s.cdnMode {
+				perFrameNS := time.Since(start).Nanoseconds() / int64(frames)
+				for {
+					old := lane.flushNS.Load()
+					if lane.flushNS.CompareAndSwap(old, updateMultiFlushCost(old, perFrameNS)) {
+						break
+					}
+				}
+				lane.pending.Add(-int64(frames))
+			}
 			select {
 			case sess.laneSpace <- struct{}{}:
 			default:
-			}
-			if err := multiWriteFrame(w, f); err != nil {
-				return
-			}
-			if err := controller.Flush(); err != nil {
-				return
 			}
 		case <-ticker.C:
 			if err := multiWriteFrame(w, multiFrame{}); err != nil {

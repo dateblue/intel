@@ -137,3 +137,32 @@ func TestMultiCDNLanePhysicalDialTargets(t *testing.T) {
 		t.Fatal("direct path must remain untouched")
 	}
 }
+
+// CDN v0.3: unlike the unchanged direct path, the CDN scheduler should avoid
+// a lane with a blocked/slow origin-side H2 writer when another lane is ready.
+func TestMultiCDNDownAvoidsSlowLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &multiServerSession{
+		parent: &Server{cdnMode: true}, ctx: ctx,
+		laneCount: 2, lanes: make([]*multiServerLane, 2),
+		laneSpace: make(chan struct{}, 1),
+	}
+	for i := range s.lanes {
+		s.lanes[i] = &multiServerLane{queue: make(chan multiFrame, multiLaneQueue)}
+	}
+	s.lanes[0].flushNS.Store(50_000_000)
+	s.lanes[0].pending.Store(3)
+	s.lanes[1].flushNS.Store(1_000_000)
+	input := bytes.Repeat([]byte("z"), multiChunk)
+	n, err := s.writeDown(input)
+	if err != nil || n != len(input) {
+		t.Fatalf("write=%d err=%v", n, err)
+	}
+	if len(s.lanes[0].queue) != 0 || len(s.lanes[1].queue) != 1 {
+		t.Fatalf("unexpected lane selection: queue0=%d queue1=%d", len(s.lanes[0].queue), len(s.lanes[1].queue))
+	}
+	if f := <-s.lanes[1].queue; f.offset != 0 || !bytes.Equal(f.data, input) {
+		t.Fatal("CDN scheduler corrupted original data")
+	}
+}
