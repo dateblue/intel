@@ -92,5 +92,5 @@ func (r *platformAutoRedirect) Close() error {
 	r.sessionAccess.Lock()
 	session := r.session
 	r.sessionAccess.Unlock()
-	return common.Close(common.PtrOrNil(r.redirectServer), session)
+	return common.Close(session, common.PtrOrNil(r.redirectServer))
 }

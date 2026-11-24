@@ -323,7 +323,7 @@ func (b *backendLinux) batchReadLoop() {
 			if !tun.IsRecoverableReadError(err) {
 				return
 			}
-			readRetry.Wait()
+			readRetry.Wait(err)
 		} else {
 			readRetry.Reset()
 		}
