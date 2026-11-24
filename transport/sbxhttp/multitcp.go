@@ -819,10 +819,14 @@ func (*multiClientConn) NeedAdditionalReadDeadline() bool { return true }
 // Server-side session is independent of the individual GET request contexts.
 // The first GET creates it; all lanes must join before the VLESS handler starts.
 type multiServerLane struct {
-	queue      chan multiFrame
-	pending    atomic.Int64 // enqueued + in-flight downlink frames
-	flushNS    atomic.Int64 // origin-side H2 Flush EWMA
-	stallCount atomic.Int64 // CDN v2 suspected slow/blocked lane penalty
+	queue            chan multiFrame
+	pending          atomic.Int64 // enqueued + in-flight downlink frames
+	flushNS          atomic.Int64 // origin-side H2 Flush EWMA
+	stallCount       atomic.Int64 // CDN v2 suspected slow/blocked lane penalty
+	resReceivedBytes uint64       // cumulative physical bytes reported by client
+	resReceivedAt    time.Time
+	resMeasuredBPS   float64 // receive-side EWMA, NOT server-side H2 flush
+	resVirtualFinish time.Time
 }
 type multiServerSession struct {
 	parent         *Server
@@ -854,6 +858,8 @@ type multiServerSession struct {
 	resUnacked     map[uint64]*multiResFlight
 	resInFlight    int
 	resAcked       uint64
+	resLastAckAt   time.Time        // guard against unnecessary periodic retransmits
+	resPrimary     *multiServerLane // stable until physical GET disconnects; speed alone never changes it
 	resAlive       int
 	resLastAlive   time.Time
 	resUpTimer     atomic.Bool

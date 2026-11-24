@@ -26,7 +26,7 @@ import (
 
 const (
 	multiResWindow       = 3 << 20 // stay below 4-MiB client reorder window
-	multiResRetry        = 450 * time.Millisecond
+	multiResRetry        = 900 * time.Millisecond
 	multiResSessionGrace = 45 * time.Second // no live GET => grace for reattach
 )
 
@@ -148,8 +148,16 @@ func (c *Client) dialMultiResilient(ctx context.Context) (net.Conn, error) {
 	if c.logger != nil {
 		go m.logMultiStats()
 	}
-	for i := 0; i < count; i++ {
-		go m.resLaneWorker(i)
+	// Start only two candidate workers. Optional lanes are admitted after
+	// the session has delivered enough data to justify additional sockets.
+	// If neither initial worker can attach, resExpandWorkers probes the
+	// remaining candidates after a short grace period for availability.
+	go m.resLaneWorker(0)
+	if count > 1 {
+		go m.resLaneWorker(1)
+	}
+	if count > 2 {
+		go m.resExpandWorkers(2, count)
 	}
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -181,6 +189,7 @@ func (m *multiClientConn) resExpandWorkers(start, count int) {
 	defer ticker.Stop()
 	launch := start
 	started := time.Now()
+	lastExpansion := time.Time{}
 	for launch < count {
 		select {
 		case <-m.ctx.Done():
@@ -206,14 +215,23 @@ func (m *multiClientConn) resExpandWorkers(start, count int) {
 		}
 		// 3rd at 256 KiB, 4th 512 KiB, 5th 1 MiB, 6th 2 MiB.
 		threshold := uint64(256*1024) << uint(launch-2)
-		if ready && active >= 2 && m.delivered.Load() < threshold {
-			continue
-		}
-		if ready && active == 1 && m.delivered.Load() < threshold && time.Since(started) < time.Duration(launch-1)*2*time.Second {
-			continue
+		// Do not create optional lanes merely because a short request has
+		// remained open for a few seconds. Only a sustained transfer earns
+		// more CDN sockets; the two primary workers already search the full
+		// candidate list when their edges fail.
+		if ready && active > 0 {
+			if m.delivered.Load() < threshold {
+				continue
+			}
+			// Give the last admitted auxiliary time to prove useful before
+			// adding another TCP. Long downloads still grow toward six paths.
+			if !lastExpansion.IsZero() && time.Since(lastExpansion) < 2*time.Second {
+				continue
+			}
 		}
 
 		go m.resLaneWorker(launch)
+		lastExpansion = time.Now()
 		launch++
 		// If there is no reachable primary, probe all remaining candidates.
 	}
@@ -420,6 +438,9 @@ func (m *multiClientConn) sendResilientPOST(path string, body []byte) error {
 			return err
 		}
 		m.setHeaders(req)
+		if isAck {
+			req.Header.Set("X-SBXHTTP-Lane-RX", m.resRXReport())
+		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		tr := m.parent.multiResUploadTransport(target)
 		resp, err := tr.RoundTrip(req)
@@ -487,10 +508,27 @@ func (m *multiClientConn) chooseResUpEdge(attempt int) (M.Socksaddr, time.Durati
 	return M.Socksaddr{}, shortest, false
 }
 
+// Physical per-lane bytes observed at the Windows client. This rides in the
+// existing ACK POST, so it does not create a new polling connection or require
+// a separate feedback request. Report format: "0:12345,1:67890" (max 6).
+func (m *multiClientConn) resRXReport() string {
+	m.lanesMu.RLock()
+	defer m.lanesMu.RUnlock()
+	var parts []string
+	for slot, lane := range m.lanes {
+		if lane != nil {
+			parts = append(parts, strconv.Itoa(slot)+":"+strconv.FormatUint(lane.rxBytes.Load(), 10))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 func (m *multiClientConn) resAckUploader() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var last uint64
+	var lastReport string
+	var lastSent time.Time
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -498,7 +536,8 @@ func (m *multiClientConn) resAckUploader() {
 		case <-ticker.C:
 		}
 		value := m.ackOffset.Load()
-		if value <= last {
+		report := m.resRXReport()
+		if value <= last && (report == lastReport || time.Since(lastSent) < 500*time.Millisecond) {
 			continue
 		}
 		path := strings.TrimRight(m.parent.target.Path, "/") + "/multi/ack/" + m.sessionID + "/" + strconv.FormatUint(value, 10)
@@ -509,6 +548,8 @@ func (m *multiClientConn) resAckUploader() {
 			continue // next tick retries latest cumulative offset
 		}
 		last = value
+		lastReport = report
+		lastSent = time.Now()
 	}
 }
 
@@ -530,7 +571,7 @@ func (s *Server) multiResGET(w http.ResponseWriter, r *http.Request, id string, 
 			laneSpace: make(chan struct{}, 1), upReader: ur, upWriter: uw,
 			packets: make(map[uint64][]byte), upFrames: make(chan multiFrame, 4*count),
 			streamAttached: make([]bool, count), resilient: true, resWake: make(chan struct{}, 1), resRepairWake: make(chan struct{}, 1),
-			resUnacked: make(map[uint64]*multiResFlight), resLastAlive: time.Now(),
+			resUnacked: make(map[uint64]*multiResFlight), resLastAlive: time.Now(), resLastAckAt: time.Now(),
 		}
 		sess.packetCond = sync.NewCond(&sess.packetMu)
 		s.multiSessions[id] = sess
@@ -550,6 +591,12 @@ func (s *Server) multiResGET(w http.ResponseWriter, r *http.Request, id string, 
 	}
 	lane := &multiServerLane{queue: make(chan multiFrame, multiCDNLaneQueue)}
 	sess.lanes[slot] = lane
+	if sess.resPrimary == nil {
+		sess.resPrimary = lane
+		if s.logger != nil {
+			s.logger.Debug("sbxhttp CDN v0.6 primary lane=", slot+1)
+		}
+	}
 	sess.resAlive++
 	sess.resLastAlive = time.Now()
 	sess.resSignal()
@@ -560,6 +607,18 @@ func (s *Server) multiResGET(w http.ResponseWriter, r *http.Request, id string, 
 		sess.resMu.Lock()
 		if sess.lanes[slot] == lane {
 			sess.lanes[slot] = nil
+			if sess.resPrimary == lane {
+				sess.resPrimary = nil
+				for newSlot, candidate := range sess.lanes {
+					if candidate != nil && candidate != lane {
+						sess.resPrimary = candidate
+						if s.logger != nil {
+							s.logger.Debug("sbxhttp CDN v0.6 primary failover to lane=", newSlot+1)
+						}
+						break
+					}
+				}
+			}
 			sess.resAlive--
 			sess.resLastAlive = time.Now()
 			for _, f := range sess.resUnacked {
@@ -649,32 +708,98 @@ func (s *multiServerSession) resSignal() {
 	}
 }
 
+// Caller holds resMu. The primary role is stable while that GET is active.
+// All lanes compete by actual client receive rate, not H2 Flush duration.
+// Fast secondary paths may win MOST frames while a slower healthy primary
+// remains the session's continuity anchor.
 func (s *multiServerSession) resChooseLane(avoid *multiServerLane) *multiServerLane {
-	load := make([]multiLaneLoad, len(s.lanes))
-	healthy := false
-	for _, l := range s.lanes {
-		if l != nil && l != avoid && l.stallCount.Load() < 3 {
-			healthy = true
-			break
+	now := time.Now()
+	loads := make([]multiAdaptiveLane, len(s.lanes))
+	outstanding := make(map[*multiServerLane]int, len(s.lanes))
+	for _, flight := range s.resUnacked {
+		if flight.owner != nil {
+			outstanding[flight.owner] += len(flight.frame.data)
 		}
 	}
-	for i, l := range s.lanes {
-		if l == nil || l == avoid {
+	for i, lane := range s.lanes {
+		if lane == nil || lane == avoid {
 			continue
 		}
-		// Never disable the last surviving lane. With an alternative live
-		// path, deprioritize the one repeatedly implicated in stalled ACKs.
-		if healthy && l.stallCount.Load() >= 3 {
-			continue
+		loads[i] = multiAdaptiveLane{
+			live:          len(lane.queue) < cap(lane.queue),
+			primary:       lane == s.resPrimary,
+			receivedBPS:   lane.resMeasuredBPS,
+			receivedAt:    lane.resReceivedAt,
+			pending:       lane.pending.Load(),
+			unacked:       outstanding[lane],
+			virtualFinish: lane.resVirtualFinish,
+			stalls:        lane.stallCount.Load(),
 		}
-		load[i] = multiLaneLoad{pending: l.pending.Load(), flushNS: l.flushNS.Load(), available: len(l.queue) < cap(l.queue)}
 	}
-	index := selectMultiLane(load, s.nextLane)
-	if index < 0 {
+	idx, finish := multiAdaptivePick(loads, now, multiChunk)
+	if idx < 0 {
 		return nil
 	}
-	s.nextLane = (index + 1) % len(s.lanes)
-	return s.lanes[index]
+	s.lanes[idx].resVirtualFinish = finish
+	s.nextLane = (idx + 1) % len(s.lanes)
+	return s.lanes[idx]
+}
+
+// The client reports monotone received-byte counters (not speed guesses).
+// We calculate a smoothed receive rate on the server. A source that becomes
+// silent loses its large auxiliary budget after 3s; it can still be probed.
+// Invalid/oversized headers are ignored: feedback is optional, never fatal.
+func (s *multiServerSession) resIngestRX(header string, now time.Time) {
+	if len(header) > 240 {
+		return
+	}
+	for _, entry := range strings.Split(header, ",") {
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		slot, err1 := strconv.Atoi(parts[0])
+		total, err2 := strconv.ParseUint(parts[1], 10, 64)
+		if err1 != nil || err2 != nil || slot < 0 || slot >= len(s.lanes) {
+			continue
+		}
+		lane := s.lanes[slot]
+		if lane == nil {
+			continue
+		}
+		if lane.resReceivedAt.IsZero() || total < lane.resReceivedBytes {
+			lane.resReceivedBytes = total
+			lane.resReceivedAt = now
+			lane.resMeasuredBPS = 0
+			continue
+		}
+		delta := total - lane.resReceivedBytes
+		elapsed := now.Sub(lane.resReceivedAt)
+		if elapsed < 250*time.Millisecond {
+			continue
+		}
+		if delta > 0 {
+			measured := float64(delta) / elapsed.Seconds()
+			if measured > multiAdaptiveMaximumBPS {
+				measured = multiAdaptiveMaximumBPS
+			}
+			if lane.resMeasuredBPS == 0 || elapsed >= 2*time.Second {
+				lane.resMeasuredBPS = measured
+			} else {
+				lane.resMeasuredBPS = 0.65*lane.resMeasuredBPS + 0.35*measured
+			}
+			lane.resReceivedAt = now
+			lane.resReceivedBytes = total
+			// A previously penalized lane may recover; positive client RX
+			// feedback gradually restores its eligibility.
+			if old := lane.stallCount.Load(); old > 0 {
+				lane.stallCount.CompareAndSwap(old, old-1)
+			}
+		} else if elapsed > 2*time.Second {
+			lane.resMeasuredBPS = 0
+			// keep last successful sample time to indicate stale auxiliary
+		}
+	}
 }
 
 func (s *multiServerSession) writeDownResilient(b []byte) (int, error) {
@@ -691,8 +816,20 @@ func (s *multiServerSession) writeDownResilient(b []byte) (int, error) {
 		}
 		var wake <-chan struct{}
 		s.resMu.Lock()
+		// Do not advance a lane's virtual schedule when the global ACK
+		// window is full; no payload has actually been assigned yet.
+		if s.resInFlight+n > multiResWindow {
+			wake = s.resWake
+			s.resMu.Unlock()
+			select {
+			case <-wake:
+			case <-s.ctx.Done():
+				return written, net.ErrClosed
+			}
+			continue
+		}
 		lane := s.resChooseLane(nil)
-		if s.resInFlight+n > multiResWindow || lane == nil {
+		if lane == nil {
 			wake = s.resWake
 			s.resMu.Unlock()
 			select {
@@ -724,7 +861,11 @@ func (s *Server) multiResACK(w http.ResponseWriter, r *http.Request, id string, 
 		return
 	}
 	sess.resMu.Lock()
+	sess.resIngestRX(r.Header.Get("X-SBXHTTP-Lane-RX"), time.Now())
 	if ack >= sess.resAcked && ack <= sess.nextOffset {
+		if ack > sess.resAcked {
+			sess.resLastAckAt = time.Now()
+		}
 		sess.resAcked = ack
 		for offset, f := range sess.resUnacked {
 			if offset+uint64(len(f.frame.data)) <= ack {
@@ -791,26 +932,21 @@ func (s *multiServerSession) resMaintenance() {
 				earliest = f
 			}
 		}
-		if earliest != nil && earliest.owner != nil {
-			timeout := multiResRetry
-			if s.resAlive == 1 {
-				timeout = 3 * time.Second
-			}
-			if now.Sub(earliest.lastSend) >= timeout {
-				previous := earliest.owner
-				alternate := s.resChooseLane(earliest.owner)
-				if alternate == nil && s.resAlive == 1 {
-					alternate = s.resChooseLane(nil)
-				}
-				if alternate != nil {
-					if previous != nil && previous != alternate {
-						previous.stallCount.Add(1)
-					}
-					earliest.owner = alternate
-					earliest.lastSend = now
-					alternate.pending.Add(1)
-					alternate.queue <- earliest.frame
-				}
+		// TCP already retransmits on a single surviving GET. Replaying the
+		// same payload on that *same* live TCP only increases congestion.
+		// Cross-lane replay is useful only when cumulative ACK has actually
+		// stalled, not merely because a frame is 450ms old while ACKs flow.
+		if earliest != nil && earliest.owner != nil && s.resAlive > 1 &&
+			now.Sub(s.resLastAckAt) >= multiResRetry &&
+			now.Sub(earliest.lastSend) >= multiResRetry {
+			previous := earliest.owner
+			alternate := s.resChooseLane(previous)
+			if alternate != nil {
+				previous.stallCount.Add(1)
+				earliest.owner = alternate
+				earliest.lastSend = now
+				alternate.pending.Add(1)
+				alternate.queue <- earliest.frame
 			}
 		}
 		s.resMu.Unlock()
