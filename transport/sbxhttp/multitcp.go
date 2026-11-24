@@ -1,14 +1,11 @@
 package sbxhttp
 
-// Experimental MultiTCP transport for private sing-box <-> sing-box deployments.
-// Unlike XMUX, it stripes ONE logical VLESS byte stream across 1/2/4 independently
-// dialled TCP+TLS+HTTP/2 connections. Each ClientConn is constructed over an
-// explicitly dialled socket: an HTTP/2 Stream is NOT counted as another lane.
-//
-// Direct: independent REALITY + H2 sockets. CDN: independent normal TLS + H2
-// sockets to the edge, while the origin still receives regular H2 requests.
-// The v1 experiment fails closed if any downlink lane breaks: it does NOT
-// promise zero-loss migration or hide upstream retransmission problems.
+// MultiTCP is a private sing-box <-> sing-box transport, not Xray wire-compatible.
+// Each CDN downlink lane is an HTTP/2 stream tied to one chosen Cloudflare IP.
+// v0.4 may reuse each physical H2 socket between at most two sessions; distinct
+// CF IP lanes still have distinct sockets and independent congestion control.
+// CDN packet-up uses a separate H2 transport. Reality/direct is unchanged.
+// A broken downlink still fails closed: ACK/retransmission is not yet present.
 
 import (
 	"bytes"
@@ -36,6 +33,7 @@ const (
 	multiWireVersion   = "1"
 	multiPreamble      = "SBXM1"
 	multiLaneQueue     = 8
+	multiCDNLaneQueue  = 3  // tighter CDN backlog limits ahead-of-line stalls
 	multiSessionLimit  = 96 // includes incomplete unauthenticated sessions
 	multiAttachTimeout = 30 * time.Second
 )
@@ -48,24 +46,34 @@ type multiClientLane struct {
 	streamWriter *io.PipeWriter
 	streamQueue  chan multiFrame
 	rxBytes      atomic.Uint64 // actual downlink payload bytes received from this CF IP
+	release      func()        // pooled CDN socket lease; nil for direct/private physical socket
+	retire       func()        // mark failed physical socket unusable after active users finish
+	reused       bool          // H2 request on an already-open physical TCP
+	closeOnce    sync.Once
 }
 
 func (l *multiClientLane) close() {
-	if l.body != nil {
-		_ = l.body.Close()
-	}
-	if l.streamReader != nil {
-		_ = l.streamReader.CloseWithError(net.ErrClosed)
-	}
-	if l.streamWriter != nil {
-		_ = l.streamWriter.CloseWithError(net.ErrClosed)
-	}
-	if l.h2 != nil {
-		_ = l.h2.Close()
-	}
-	if l.physical != nil {
-		_ = l.physical.Close()
-	}
+	l.closeOnce.Do(func() {
+		if l.body != nil {
+			_ = l.body.Close()
+		}
+		if l.streamReader != nil {
+			_ = l.streamReader.CloseWithError(net.ErrClosed)
+		}
+		if l.streamWriter != nil {
+			_ = l.streamWriter.CloseWithError(net.ErrClosed)
+		}
+		if l.release != nil {
+			l.release() // never close a shared physical TCP still in use
+			return
+		}
+		if l.h2 != nil {
+			_ = l.h2.Close()
+		}
+		if l.physical != nil {
+			_ = l.physical.Close()
+		}
+	})
 }
 
 type multiClientConn struct {
@@ -73,6 +81,7 @@ type multiClientConn struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lanes        []*multiClientLane
+	laneCount    int
 	upReader     *io.PipeReader
 	upWriter     *io.PipeWriter
 	downReader   *io.PipeReader
@@ -87,7 +96,38 @@ type multiClientConn struct {
 	delivered    atomic.Uint64 // ordered bytes delivered to the application
 }
 
+// A four-lane CDN session is an optimization, not a correctness requirement.
+// If any initial lane fails, retry the *whole logical session* with two lanes;
+// never silently omit a lane within the same v1 wire session. Temporarily
+// avoid four lanes after a failure to stop repeated dial bursts.
 func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
+	if !c.cdnMode || c.multiDown != 4 {
+		return c.dialMultiTCPCount(ctx, c.multiDown)
+	}
+	timeout, err := boundedHandshakeTimeout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	budget, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if time.Now().UnixNano() < c.multiFourBackoff.Load() {
+		return c.dialMultiTCPCount(budget, 2)
+	}
+	conn, err := c.dialMultiTCPCount(budget, 4)
+	if err == nil {
+		return conn, nil
+	}
+	if budget.Err() != nil {
+		return nil, err
+	}
+	c.multiFourBackoff.Store(time.Now().Add(60 * time.Second).UnixNano())
+	if c.logger != nil {
+		c.logger.Warn("sbxhttp MultiTCP: 4-lane attach failed (", err, "); falling back to 2 lanes for 60s")
+	}
+	return c.dialMultiTCPCount(budget, 2)
+}
+
+func (c *Client) dialMultiTCPCount(ctx context.Context, count int) (net.Conn, error) {
 	if c.closed.Load() {
 		return nil, net.ErrClosed
 	}
@@ -102,14 +142,14 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	ur, uw := io.Pipe()
 	dr, dw := io.Pipe()
-	m := &multiClientConn{parent: c, ctx: lifetime, cancel: cancel, upReader: ur, upWriter: uw, downReader: dr, downWriter: dw, frames: make(chan multiFrame, 4*c.multiDown), streamSpace: make(chan struct{}, 1)}
+	m := &multiClientConn{parent: c, ctx: lifetime, cancel: cancel, upReader: ur, upWriter: uw, downReader: dr, downWriter: dw, frames: make(chan multiFrame, 4*count), laneCount: count, streamSpace: make(chan struct{}, 1)}
 	if !c.cdnMode {
 		// In contrast to http2.Transport.RoundTrip, NewClientConn cannot silently
 		// reuse another lane's TCP connection or silently create additional dials.
-		m.lanes = make([]*multiClientLane, 0, c.multiDown)
+		m.lanes = make([]*multiClientLane, 0, count)
 		dialCtx, stopDial := context.WithTimeout(ctx, timeout)
 		defer stopDial()
-		for i := 0; i < c.multiDown; i++ {
+		for i := 0; i < count; i++ {
 			l, err := c.newMultiLane(dialCtx, i)
 			if err != nil {
 				_ = m.Close()
@@ -117,7 +157,7 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 			}
 			m.lanes = append(m.lanes, l)
 			if c.logger != nil {
-				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", c.multiDown,
+				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", count,
 					" local=", l.physical.LocalAddr(), " remote=", l.physical.RemoteAddr(),
 					" independently dialled H2/TCP")
 			}
@@ -170,7 +210,7 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 		// were dialled AND their GET preambles awaited serially, amplifying
 		// latency tests by N handshakes. Each result owns its socket until the
 		// coordinator has collected ALL results (including on errors).
-		m.lanes = make([]*multiClientLane, c.multiDown)
+		m.lanes = make([]*multiClientLane, count)
 		dialCtx, stopDial := context.WithTimeout(ctx, timeout)
 		defer stopDial()
 		type laneResult struct {
@@ -178,8 +218,8 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 			lane  *multiClientLane
 			err   error
 		}
-		results := make(chan laneResult, c.multiDown)
-		for i := 0; i < c.multiDown; i++ {
+		results := make(chan laneResult, count)
+		for i := 0; i < count; i++ {
 			go func(index int) {
 				l, err := c.newMultiLane(dialCtx, index)
 				if err != nil {
@@ -203,6 +243,9 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 							}
 						}
 						if err != nil {
+							if l.retire != nil {
+								l.retire()
+							}
 							_ = resp.Body.Close()
 						} else {
 							l.body = resp.Body
@@ -218,7 +261,7 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 			}(i)
 		}
 		var firstErr error
-		for remaining := c.multiDown; remaining > 0; remaining-- {
+		for remaining := count; remaining > 0; remaining-- {
 			// Timeout cancels the GET context and closes any partially opened H2
 			// connection; we still collect every result so no socket is orphaned.
 			select {
@@ -247,9 +290,9 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 		}
 		if c.logger != nil {
 			for i, l := range m.lanes {
-				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", c.multiDown,
+				c.logger.Debug("sbxhttp MultiTCP lane=", i+1, "/", count,
 					" local=", l.physical.LocalAddr(), " remote=", l.physical.RemoteAddr(),
-					" independently dialled H2/TCP")
+					" H2 downlink socket reused=", l.reused)
 			}
 		}
 	}
@@ -269,6 +312,9 @@ func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
 		go m.downReaderLoop(l)
 	}
 	if c.cdnMode {
+		if c.logger != nil {
+			c.logger.Debug("sbxhttp MultiTCP v0.4: packet-up independent of GET lanes; pooled H2 downlink streams (max 2/socket)")
+		}
 		go m.packetUploader(id)
 	} else {
 		for i, l := range m.lanes {
@@ -300,10 +346,22 @@ func (c *Client) multiDialTarget(laneIndex int) M.Socksaddr {
 	return c.serverAddr
 }
 
+// CDN mode reuses a tightly bounded physical H2 connection (NOT Xray XMUX).
+// Only the request stream belongs to this session; Reset closes the pool.
 func (c *Client) newMultiLane(ctx context.Context, laneIndex int) (*multiClientLane, error) {
+	dialTarget := c.multiDialTarget(laneIndex)
+	if !c.cdnMode {
+		return c.newMultiPhysicalLane(ctx, dialTarget)
+	}
+	pool := c.getMultiPool(dialTarget.String())
+	return pool.acquire(ctx, func(dialCtx context.Context) (*multiClientLane, error) {
+		return c.newMultiPhysicalLane(dialCtx, dialTarget)
+	})
+}
+
+func (c *Client) newMultiPhysicalLane(ctx context.Context, dialTarget M.Socksaddr) (*multiClientLane, error) {
 	// This only controls the client -> CF edge hop. The CF -> VPS connection
 	// and anycast PoP selection are entirely controlled by Cloudflare.
-	dialTarget := c.multiDialTarget(laneIndex)
 	raw, err := c.tlsDialer.DialTLSContext(ctx, dialTarget)
 	if err != nil {
 		return nil, err
@@ -328,7 +386,7 @@ func (c *Client) newMultiLane(ctx context.Context, laneIndex int) (*multiClientL
 func (m *multiClientConn) setHeaders(req *http.Request) {
 	req.Host = m.parent.config.ServerName()
 	req.Header.Set(multiHeader, multiWireVersion)
-	req.Header.Set("X-SBXHTTP-Lanes", strconv.Itoa(m.parent.multiDown))
+	req.Header.Set("X-SBXHTTP-Lanes", strconv.Itoa(m.laneCount))
 	req.Header.Set("Cache-Control", "no-store, no-transform")
 	req.Header.Set("Accept-Encoding", "identity")
 	if m.parent.visionInnerTLS {
@@ -339,6 +397,14 @@ func (m *multiClientConn) downReaderLoop(l *multiClientLane) {
 	for {
 		f, err := multiReadFrame(l.body)
 		if err != nil {
+			if m.ctx.Err() == nil {
+				if l.retire != nil {
+					l.retire()
+				}
+				if m.parent.cdnMode && m.laneCount == 4 {
+					m.parent.multiFourBackoff.Store(time.Now().Add(60 * time.Second).UnixNano())
+				}
+			}
 			_ = m.Close()
 			return
 		}
@@ -415,8 +481,8 @@ func (m *multiClientConn) logMultiStats() {
 	}
 }
 
-// Bounded upload batching. Requests are distributed over the same explicit
-// physical H2 lanes, so BOTH directions have multiple independent TCP cwnds.
+// Bounded packet-up batching. v0.4 sends POST via its own CDN-only H2
+// transport: no request is scheduled on a downlink socket.
 func (m *multiClientConn) packetUploader(id string) {
 	chunks := make(chan []byte, 16)
 	go func() {
@@ -488,6 +554,17 @@ func (m *multiClientConn) packetUploader(id string) {
 	}
 }
 func (m *multiClientConn) sendPacket(id string, seq uint64, p []byte) error {
+	// A global limit complements each session's cdnInflight limiter. It avoids
+	// turning dozens of independent small POSTs into hundreds of concurrent
+	// H2 streams on one shared upstream physical TCP.
+	if m.parent.multiUpSlots != nil {
+		select {
+		case m.parent.multiUpSlots <- struct{}{}:
+			defer func() { <-m.parent.multiUpSlots }()
+		case <-m.ctx.Done():
+			return m.ctx.Err()
+		}
+	}
 	path := strings.TrimRight(m.parent.target.Path, "/") + "/multi/up/" + id + "/" + strconv.FormatUint(seq, 10)
 	target := url.URL{Scheme: "https", Host: m.parent.serverAddr.String(), Path: path}
 	var last error
@@ -503,9 +580,10 @@ func (m *multiClientConn) sendPacket(id string, seq uint64, p []byte) error {
 		}
 		m.setHeaders(req)
 		req.Header.Set("Content-Type", "application/octet-stream")
-		// Prefer a different physical connection for retries.
-		l := m.lanes[(int(seq%uint64(len(m.lanes)))+attempt)%len(m.lanes)]
-		resp, err := l.h2.RoundTrip(req)
+		// Upstream is physically independent from every downlink GET lane.
+		// A small shared H2 client is beneficial here: POST requests are short,
+		// and a failed download lane must not poison the upload socket.
+		resp, err := m.parent.getMultiUploadTransport().RoundTrip(req)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
@@ -969,7 +1047,11 @@ func (s *Server) multiDownGET(w http.ResponseWriter, r *http.Request, id string,
 		http.Error(w, "duplicate or invalid lane", http.StatusConflict)
 		return
 	}
-	lane := &multiServerLane{queue: make(chan multiFrame, multiLaneQueue)}
+	queueDepth := multiLaneQueue
+	if s.cdnMode {
+		queueDepth = multiCDNLaneQueue
+	}
+	lane := &multiServerLane{queue: make(chan multiFrame, queueDepth)}
 	sess.lanes[idx] = lane
 	s.multiMu.Unlock()
 

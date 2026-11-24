@@ -1,9 +1,6 @@
-// Package sbxhttp implements a deliberately small sing-box-to-sing-box HTTP/2
-// VLESS transport. It is NOT wire-compatible with Xray XHTTP.
-//
-// Each logical tunnel uses its own HTTP/2 connection. This intentionally
-// eliminates cross-stream head-of-line amplification from XMUX at the cost
-// of additional TCP/TLS handshakes and connection overhead.
+// Package sbxhttp implements a sing-box-to-sing-box HTTP/2 VLESS transport.
+// It is NOT wire-compatible with Xray XHTTP. CDN MultiTCP v0.4 uses narrowly
+// bounded H2 socket reuse; Reality/direct transport remains independent.
 package sbxhttp
 
 import (
@@ -30,8 +27,8 @@ import (
 
 var _ adapter.V2RayClientTransport = (*Client)(nil)
 
-// Client is a small factory: it intentionally owns no shared HTTP/2 pool.
-// One call to DialContext == one independent TLS/TCP + HTTP/2 connection.
+// Client owns optional CDN-only MultiTCP socket pools. The normal/direct
+// transports keep their original independent-connection behavior.
 type Client struct {
 	serverAddr       M.Socksaddr
 	rawDialer        N.Dialer
@@ -52,6 +49,13 @@ type Client struct {
 	multiDown        int
 	multiCDNIPs      []netip.Addr
 	multiSessions    map[*multiClientConn]struct{}
+	multiPoolMu      sync.Mutex
+	multiPools       map[string]*multiH2Pool
+	multiUploadMu    sync.Mutex
+	multiUpload      *http2.Transport
+	multiUploadDials atomic.Uint32
+	multiUpSlots     chan struct{} // bound aggregate packet-up H2 stream concurrency
+	multiFourBackoff atomic.Int64  // CDN four-lane failure: temporarily prefer two-lane sessions
 }
 
 func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts option.V2RaySBXHTTPOptions, config tls.Config) (adapter.V2RayClientTransport, error) {
@@ -92,7 +96,7 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	}
 	// Explicit h2-only ALPN. Reality/uTLS is negotiated by sing-box's TLS stack.
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	c := &Client{serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{}), multiDown: opts.DownConnections, multiCDNIPs: cdnIPs, multiSessions: make(map[*multiClientConn]struct{})}
+	c := &Client{serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{}), multiDown: opts.DownConnections, multiCDNIPs: cdnIPs, multiSessions: make(map[*multiClientConn]struct{}), multiPools: make(map[string]*multiH2Pool), multiUpSlots: make(chan struct{}, 32)}
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }
@@ -276,6 +280,7 @@ func (c *Client) Reset() {
 		_ = s.Close()
 	}
 	c.cdnReset()
+	c.multiResetPool()
 	for _, s := range reliable {
 		if c.reliable && !c.closed.Load() {
 			s.resetPhysical()
