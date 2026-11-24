@@ -60,8 +60,8 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	if len(options.CDNIPs) > 0 {
 		return nil, errors.New("sbxhttp: cdn_ips is a CDN client-only option; the server only receives the common session ID")
 	}
-	if options.DownConnections != 0 && options.DownConnections != 1 && options.DownConnections != 2 && options.DownConnections != 4 {
-		return nil, errors.New("sbxhttp: down_connections must be 0, 1, 2 or 4")
+	if options.DownConnections < 0 || options.DownConnections > 6 || (options.Mode != "cdn" && options.DownConnections != 0 && options.DownConnections != 1 && options.DownConnections != 2 && options.DownConnections != 4) {
+		return nil, errors.New("sbxhttp: CDN down_connections must be 0..6; direct supports 0,1,2,4")
 	}
 	if options.DownConnections > 0 && options.Reliable {
 		return nil, errors.New("sbxhttp: MultiTCP cannot combine with Replay-v2")
@@ -178,7 +178,7 @@ func (s *Server) serveOne(raw net.Conn) {
 	})
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.multiDown > 0 && r.Header.Get(multiHeader) == multiWireVersion {
+	if s.multiDown > 0 && (r.Header.Get(multiHeader) == multiWireVersion || (s.cdnMode && r.Header.Get(multiHeader) == multiResVersion)) {
 		s.serveMultiHTTP(w, r)
 		return
 	}

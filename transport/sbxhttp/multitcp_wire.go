@@ -96,6 +96,37 @@ func (a *multiReassembler) insert(f multiFrame) error {
 	a.buffered += len(f.data)
 	return nil
 }
+
+// insertResilient accepts an exact retransmission, but still rejects corrupt
+// partial overlaps and inconsistent duplicate payloads. Used only by CDN v2.
+func (a *multiReassembler) insertResilient(f multiFrame) error {
+	if len(f.data) == 0 {
+		return nil
+	}
+	end := f.offset + uint64(len(f.data))
+	if end < f.offset {
+		return errors.New("sbxhttp multitcp: offset overflow")
+	}
+	if f.offset < a.next {
+		if end <= a.next {
+			return nil
+		} // complete duplicate already delivered
+		return fmt.Errorf("sbxhttp multitcp: partial retransmit overlap %d < %d", f.offset, a.next)
+	}
+	if existing, ok := a.pending[f.offset]; ok {
+		if len(existing) != len(f.data) {
+			return errors.New("sbxhttp multitcp: duplicate length mismatch")
+		}
+		for i := range existing {
+			if existing[i] != f.data[i] {
+				return errors.New("sbxhttp multitcp: duplicate content mismatch")
+			}
+		}
+		return nil
+	}
+	return a.insert(f)
+}
+
 func (a *multiReassembler) pop() []byte {
 	data, ok := a.pending[a.next]
 	if !ok {

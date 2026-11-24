@@ -5,7 +5,8 @@ package sbxhttp
 // v0.4 may reuse each physical H2 socket between at most two sessions; distinct
 // CF IP lanes still have distinct sockets and independent congestion control.
 // CDN packet-up uses a separate H2 transport. Reality/direct is unchanged.
-// A broken downlink still fails closed: ACK/retransmission is not yet present.
+// CDN v2 uses dynamic lane attachment and cumulative ACK/retransmission.
+// Direct/REALITY and legacy CDN v1 remain isolated and unchanged.
 
 import (
 	"bytes"
@@ -30,7 +31,8 @@ import (
 
 const (
 	multiHeader        = "X-SBXHTTP-Multi"
-	multiWireVersion   = "1"
+	multiWireVersion   = "1" // legacy/direct protocol
+	multiResVersion    = "2" // CDN fault-tolerant protocol; both peers require v0.5
 	multiPreamble      = "SBXM1"
 	multiLaneQueue     = 8
 	multiCDNLaneQueue  = 3  // tighter CDN backlog limits ahead-of-line stalls
@@ -81,6 +83,12 @@ type multiClientConn struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lanes        []*multiClientLane
+	lanesMu      sync.RWMutex // CDN v2 dynamically replaces failed GET sockets
+	resilient    bool
+	sessionID    string
+	readyCh      chan struct{}
+	readyOnce    sync.Once
+	ackOffset    atomic.Uint64
 	laneCount    int
 	upReader     *io.PipeReader
 	upWriter     *io.PipeWriter
@@ -101,6 +109,9 @@ type multiClientConn struct {
 // never silently omit a lane within the same v1 wire session. Temporarily
 // avoid four lanes after a failure to stop repeated dial bursts.
 func (c *Client) dialMultiTCP(ctx context.Context) (net.Conn, error) {
+	if c.cdnMode {
+		return c.dialMultiResilient(ctx)
+	}
 	if !c.cdnMode || c.multiDown != 4 {
 		return c.dialMultiTCPCount(ctx, c.multiDown)
 	}
@@ -359,6 +370,13 @@ func (c *Client) newMultiLane(ctx context.Context, laneIndex int) (*multiClientL
 	})
 }
 
+func (c *Client) newMultiResLane(ctx context.Context, target M.Socksaddr) (*multiClientLane, error) {
+	pool := c.getMultiPool(target.String())
+	return pool.acquire(ctx, func(dialCtx context.Context) (*multiClientLane, error) {
+		return c.newMultiPhysicalLane(dialCtx, target)
+	})
+}
+
 func (c *Client) newMultiPhysicalLane(ctx context.Context, dialTarget M.Socksaddr) (*multiClientLane, error) {
 	// This only controls the client -> CF edge hop. The CF -> VPS connection
 	// and anycast PoP selection are entirely controlled by Cloudflare.
@@ -385,7 +403,11 @@ func (c *Client) newMultiPhysicalLane(ctx context.Context, dialTarget M.Socksadd
 }
 func (m *multiClientConn) setHeaders(req *http.Request) {
 	req.Host = m.parent.config.ServerName()
-	req.Header.Set(multiHeader, multiWireVersion)
+	version := multiWireVersion
+	if m.resilient {
+		version = multiResVersion
+	}
+	req.Header.Set(multiHeader, version)
 	req.Header.Set("X-SBXHTTP-Lanes", strconv.Itoa(m.laneCount))
 	req.Header.Set("Cache-Control", "no-store, no-transform")
 	req.Header.Set("Accept-Encoding", "identity")
@@ -397,6 +419,9 @@ func (m *multiClientConn) downReaderLoop(l *multiClientLane) {
 	for {
 		f, err := multiReadFrame(l.body)
 		if err != nil {
+			if m.resilient {
+				return
+			} // owning reconnect worker repairs this slot
 			if m.ctx.Err() == nil {
 				if l.retire != nil {
 					l.retire()
@@ -409,6 +434,12 @@ func (m *multiClientConn) downReaderLoop(l *multiClientLane) {
 			return
 		}
 		if len(f.data) == 0 {
+			if m.resilient && f.offset == ^uint64(0) {
+				// v2 explicit graceful session end. Network EOF, in contrast,
+				// is only a lane failure and is repaired by its worker.
+				_ = m.Close()
+				return
+			}
 			continue
 		}
 		if m.parent.cdnMode {
@@ -428,7 +459,13 @@ func (m *multiClientConn) assemble() {
 		case <-m.ctx.Done():
 			return
 		case f := <-m.frames:
-			if err := a.insert(f); err != nil {
+			var err error
+			if m.resilient {
+				err = a.insertResilient(f)
+			} else {
+				err = a.insert(f)
+			}
+			if err != nil {
 				_ = m.Close()
 				return
 			}
@@ -442,6 +479,9 @@ func (m *multiClientConn) assemble() {
 					return
 				}
 				m.delivered.Add(uint64(len(data)))
+				if m.resilient {
+					m.ackOffset.Store(a.next)
+				}
 			}
 		}
 	}
@@ -454,6 +494,7 @@ func (m *multiClientConn) logMultiStats() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	previous := make([]uint64, len(m.lanes))
+	oldLanes := make([]*multiClientLane, len(m.lanes))
 	var prevDelivered uint64
 	for {
 		select {
@@ -462,7 +503,20 @@ func (m *multiClientConn) logMultiStats() {
 		case <-ticker.C:
 			values := make([]string, len(m.lanes))
 			var interval uint64
-			for i, l := range m.lanes {
+			m.lanesMu.RLock()
+			snapshot := append([]*multiClientLane(nil), m.lanes...)
+			m.lanesMu.RUnlock()
+			for i, l := range snapshot {
+				if l == nil {
+					values[i] = fmt.Sprintf("lane%d=disconnected", i+1)
+					oldLanes[i] = nil
+					previous[i] = 0
+					continue
+				}
+				if oldLanes[i] != l {
+					oldLanes[i] = l
+					previous[i] = 0
+				}
 				current := l.rxBytes.Load()
 				delta := current - previous[i]
 				previous[i] = current
@@ -554,6 +608,10 @@ func (m *multiClientConn) packetUploader(id string) {
 	}
 }
 func (m *multiClientConn) sendPacket(id string, seq uint64, p []byte) error {
+	if m.resilient {
+		path := strings.TrimRight(m.parent.target.Path, "/") + "/multi/up/" + id + "/" + strconv.FormatUint(seq, 10)
+		return m.sendResilientPOST(path, p)
+	}
 	// A global limit complements each session's cdnInflight limiter. It avoids
 	// turning dozens of independent small POSTs into hundreds of concurrent
 	// H2 streams on one shared upstream physical TCP.
@@ -720,11 +778,13 @@ func (m *multiClientConn) Close() error {
 		_ = m.upReader.CloseWithError(net.ErrClosed)
 		_ = m.downWriter.CloseWithError(net.ErrClosed)
 		_ = m.downReader.CloseWithError(net.ErrClosed)
+		m.lanesMu.Lock()
 		for _, lane := range m.lanes {
 			if lane != nil {
 				lane.close()
 			}
 		}
+		m.lanesMu.Unlock()
 		m.parent.mu.Lock()
 		delete(m.parent.multiSessions, m)
 		m.parent.mu.Unlock()
@@ -732,14 +792,22 @@ func (m *multiClientConn) Close() error {
 	return nil
 }
 func (m *multiClientConn) LocalAddr() net.Addr {
-	if len(m.lanes) > 0 && m.lanes[0].physical != nil {
-		return m.lanes[0].physical.LocalAddr()
+	m.lanesMu.RLock()
+	defer m.lanesMu.RUnlock()
+	for _, l := range m.lanes {
+		if l != nil && l.physical != nil {
+			return l.physical.LocalAddr()
+		}
 	}
 	return &net.TCPAddr{}
 }
 func (m *multiClientConn) RemoteAddr() net.Addr {
-	if len(m.lanes) > 0 && m.lanes[0].physical != nil {
-		return m.lanes[0].physical.RemoteAddr()
+	m.lanesMu.RLock()
+	defer m.lanesMu.RUnlock()
+	for _, l := range m.lanes {
+		if l != nil && l.physical != nil {
+			return l.physical.RemoteAddr()
+		}
 	}
 	return &net.TCPAddr{}
 }
@@ -751,9 +819,10 @@ func (*multiClientConn) NeedAdditionalReadDeadline() bool { return true }
 // Server-side session is independent of the individual GET request contexts.
 // The first GET creates it; all lanes must join before the VLESS handler starts.
 type multiServerLane struct {
-	queue   chan multiFrame
-	pending atomic.Int64 // enqueued + in-flight downlink frames
-	flushNS atomic.Int64 // origin-side H2 Flush EWMA
+	queue      chan multiFrame
+	pending    atomic.Int64 // enqueued + in-flight downlink frames
+	flushNS    atomic.Int64 // origin-side H2 Flush EWMA
+	stallCount atomic.Int64 // CDN v2 suspected slow/blocked lane penalty
 }
 type multiServerSession struct {
 	parent         *Server
@@ -778,6 +847,16 @@ type multiServerSession struct {
 	packetCond     *sync.Cond
 	nextPacket     uint64
 	packets        map[uint64][]byte
+	resilient      bool
+	resMu          sync.Mutex
+	resWake        chan struct{}
+	resRepairWake  chan struct{}
+	resUnacked     map[uint64]*multiResFlight
+	resInFlight    int
+	resAcked       uint64
+	resAlive       int
+	resLastAlive   time.Time
+	resUpTimer     atomic.Bool
 	upFrames       chan multiFrame
 	streamAttached []bool
 }
@@ -911,6 +990,9 @@ func (s *multiServerSession) writeDownRoundRobin(b []byte) (int, error) {
 }
 
 func (s *multiServerSession) writeDown(b []byte) (int, error) {
+	if s.resilient {
+		return s.writeDownResilient(b)
+	}
 	if s.parent == nil || !s.parent.cdnMode {
 		return s.writeDownRoundRobin(b)
 	}
@@ -967,7 +1049,9 @@ func (s *multiServerSession) writeDown(b []byte) (int, error) {
 func (s *Server) serveMultiHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store, no-transform")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if r.ProtoMajor != 2 || r.URL.RawQuery != "" || r.Header.Get(multiHeader) != multiWireVersion || !privateVisionModeHeaderMatches(s.visionInnerTLS, r.Header.Get(privateVisionModeHeader)) {
+	wire := r.Header.Get(multiHeader)
+	resilient := wire == multiResVersion && s.cdnMode
+	if r.ProtoMajor != 2 || r.URL.RawQuery != "" || (!resilient && wire != multiWireVersion) || !privateVisionModeHeaderMatches(s.visionInnerTLS, r.Header.Get(privateVisionModeHeader)) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -982,7 +1066,7 @@ func (s *Server) serveMultiHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	count, err := strconv.Atoi(r.Header.Get("X-SBXHTTP-Lanes"))
-	if err != nil || count < 1 || count > s.multiDown || (count != 1 && count != 2 && count != 4) {
+	if err != nil || count < 1 || count > s.multiDown || (!resilient && count != 1 && count != 2 && count != 4) {
 		http.Error(w, "unsupported lane count", http.StatusBadRequest)
 		return
 	}
@@ -993,7 +1077,11 @@ func (s *Server) serveMultiHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid lane", http.StatusBadRequest)
 			return
 		}
-		s.multiDownGET(w, r, parts[1], lane, count)
+		if resilient {
+			s.multiResGET(w, r, parts[1], lane, count)
+		} else {
+			s.multiDownGET(w, r, parts[1], lane, count)
+		}
 	case parts[0] == "streamup" && r.Method == http.MethodPost && !s.cdnMode:
 		index, err := strconv.Atoi(parts[2])
 		if err != nil || index < 0 || index >= count {
@@ -1008,6 +1096,13 @@ func (s *Server) serveMultiHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.multiUpPOST(w, r, parts[1], seq, count)
+	case parts[0] == "ack" && resilient && r.Method == http.MethodPost:
+		ack, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil {
+			http.Error(w, "invalid ACK", http.StatusBadRequest)
+			return
+		}
+		s.multiResACK(w, r, parts[1], ack, count)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -1194,7 +1289,7 @@ func (s *Server) multiUpPOST(w http.ResponseWriter, r *http.Request, id string, 
 	s.multiMu.Lock()
 	sess := s.multiSessions[id]
 	s.multiMu.Unlock()
-	if sess == nil || sess.ctx.Err() != nil || sess.laneCount != count {
+	if sess == nil || sess.ctx.Err() != nil || sess.laneCount != count || sess.resilient != (r.Header.Get(multiHeader) == multiResVersion) {
 		http.Error(w, "unknown session", http.StatusConflict)
 		return
 	}
@@ -1226,7 +1321,11 @@ func (s *Server) multiUpPOST(w http.ResponseWriter, r *http.Request, id string, 
 	}
 	sess.upStarted.Store(true)
 	sess.packetMu.Unlock()
-	w.Header().Set(multiHeader, multiWireVersion)
+	if sess.resilient {
+		w.Header().Set(multiHeader, multiResVersion)
+	} else {
+		w.Header().Set(multiHeader, multiWireVersion)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) multiCloseAll() {

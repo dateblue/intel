@@ -30,32 +30,36 @@ var _ adapter.V2RayClientTransport = (*Client)(nil)
 // Client owns optional CDN-only MultiTCP socket pools. The normal/direct
 // transports keep their original independent-connection behavior.
 type Client struct {
-	serverAddr       M.Socksaddr
-	rawDialer        N.Dialer
-	cdnProtocol      string
-	cdnH3RetryAfter  atomic.Int64
-	tlsDialer        tls.Dialer
-	config           tls.Config
-	target           url.URL
-	closed           atomic.Bool
-	mu               sync.Mutex
-	sessions         map[*clientConn]struct{}
-	reliable         bool
-	logger           logger.ContextLogger
-	visionInnerTLS   bool
-	reliableSessions map[*reliableSession]struct{}
-	cdnMode          bool
-	cdnSessions      map[*cdnClientConn]struct{}
-	multiDown        int
-	multiCDNIPs      []netip.Addr
-	multiSessions    map[*multiClientConn]struct{}
-	multiPoolMu      sync.Mutex
-	multiPools       map[string]*multiH2Pool
-	multiUploadMu    sync.Mutex
-	multiUpload      *http2.Transport
-	multiUploadDials atomic.Uint32
-	multiUpSlots     chan struct{} // bound aggregate packet-up H2 stream concurrency
-	multiFourBackoff atomic.Int64  // CDN four-lane failure: temporarily prefer two-lane sessions
+	serverAddr        M.Socksaddr
+	rawDialer         N.Dialer
+	cdnProtocol       string
+	cdnH3RetryAfter   atomic.Int64
+	tlsDialer         tls.Dialer
+	config            tls.Config
+	target            url.URL
+	closed            atomic.Bool
+	mu                sync.Mutex
+	sessions          map[*clientConn]struct{}
+	reliable          bool
+	logger            logger.ContextLogger
+	visionInnerTLS    bool
+	reliableSessions  map[*reliableSession]struct{}
+	cdnMode           bool
+	cdnSessions       map[*cdnClientConn]struct{}
+	multiDown         int
+	multiCDNIPs       []netip.Addr
+	multiSessions     map[*multiClientConn]struct{}
+	multiPoolMu       sync.Mutex
+	multiPools        map[string]*multiH2Pool
+	multiUploadMu     sync.Mutex
+	multiUpload       *http2.Transport
+	multiUploadDials  atomic.Uint32
+	multiUpSlots      chan struct{} // bound aggregate packet-up H2 stream concurrency
+	multiFourBackoff  atomic.Int64  // kept for pre-v0.5 legacy path
+	multiEdgeMu       sync.Mutex
+	multiBadUntil     map[string]time.Time
+	multiUploadByIP   map[string]*http2.Transport
+	multiEdgeFailures map[string]int
 }
 
 func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts option.V2RaySBXHTTPOptions, config tls.Config) (adapter.V2RayClientTransport, error) {
@@ -71,8 +75,8 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	if opts.CDNProtocol != "" && opts.CDNProtocol != "h2" && opts.CDNProtocol != "h3" && opts.CDNProtocol != "auto" {
 		return nil, fmt.Errorf("sbxhttp: unsupported cdn_protocol %q", opts.CDNProtocol)
 	}
-	if opts.DownConnections != 0 && opts.DownConnections != 1 && opts.DownConnections != 2 && opts.DownConnections != 4 {
-		return nil, errors.New("sbxhttp: down_connections must be 0, 1, 2 or 4")
+	if opts.DownConnections < 0 || opts.DownConnections > 6 || (opts.Mode != "cdn" && opts.DownConnections != 0 && opts.DownConnections != 1 && opts.DownConnections != 2 && opts.DownConnections != 4) {
+		return nil, errors.New("sbxhttp: CDN down_connections must be 0..6; direct supports 0,1,2,4")
 	}
 	if opts.DownConnections > 0 && opts.Reliable {
 		return nil, errors.New("sbxhttp: MultiTCP and Replay-v2 cannot yet be combined")
@@ -96,7 +100,7 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	}
 	// Explicit h2-only ALPN. Reality/uTLS is negotiated by sing-box's TLS stack.
 	config.SetNextProtos([]string{http2.NextProtoTLS})
-	c := &Client{serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{}), multiDown: opts.DownConnections, multiCDNIPs: cdnIPs, multiSessions: make(map[*multiClientConn]struct{}), multiPools: make(map[string]*multiH2Pool), multiUpSlots: make(chan struct{}, 32)}
+	c := &Client{serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol, tlsDialer: tls.NewDialer(dialer, config), config: config, sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable, visionInnerTLS: opts.VisionInnerTLS, reliableSessions: make(map[*reliableSession]struct{}), cdnMode: opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{}), multiDown: opts.DownConnections, multiCDNIPs: cdnIPs, multiSessions: make(map[*multiClientConn]struct{}), multiPools: make(map[string]*multiH2Pool), multiUpSlots: make(chan struct{}, 32), multiBadUntil: make(map[string]time.Time), multiUploadByIP: make(map[string]*http2.Transport), multiEdgeFailures: make(map[string]int)}
 	c.target = url.URL{Scheme: "https", Host: serverAddr.String(), Path: path}
 	return c, nil
 }

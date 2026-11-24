@@ -16,8 +16,8 @@ func validateMultiCDNIPs(inputs []string, isCDN bool, laneCount int) ([]netip.Ad
 	if !isCDN {
 		return nil, fmt.Errorf("sbxhttp: cdn_ips is only valid for CDN mode")
 	}
-	if laneCount == 0 || len(inputs) > laneCount {
-		return nil, fmt.Errorf("sbxhttp: cdn_ips requires down_connections > 0 and no more IPs than lanes")
+	if laneCount == 0 || len(inputs) > 6 {
+		return nil, fmt.Errorf("sbxhttp: cdn_ips requires down_connections > 0, at most 6 candidate IPs")
 	}
 	out := make([]netip.Addr, 0, len(inputs))
 	seen := make(map[netip.Addr]struct{}, len(inputs))

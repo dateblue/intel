@@ -222,6 +222,17 @@ func (c *Client) getMultiUploadTransport() *http2.Transport {
 }
 
 func (c *Client) multiResetPool() {
+	c.multiEdgeMu.Lock()
+	clear(c.multiBadUntil)
+	clear(c.multiEdgeFailures)
+	c.multiEdgeMu.Unlock()
+	c.multiUploadMu.Lock()
+	oldByIP := c.multiUploadByIP
+	c.multiUploadByIP = make(map[string]*http2.Transport)
+	c.multiUploadMu.Unlock()
+	for _, tr := range oldByIP {
+		tr.CloseIdleConnections()
+	}
 	c.multiFourBackoff.Store(0)
 	c.multiPoolMu.Lock()
 	old := c.multiPools
