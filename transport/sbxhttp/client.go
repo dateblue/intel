@@ -41,6 +41,7 @@ type Client struct {
 	mu               sync.Mutex
 	sessions         map[*clientConn]struct{}
 	reliable         bool
+	recoveryHealth   h2HealthPolicy
 	logger           logger.ContextLogger
 	visionInnerTLS   bool
 	reliableSessions map[*reliableSession]struct{}
@@ -67,6 +68,10 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 	if err := validatePrivateVisionMode(opts.VisionInnerTLS, opts.Reliable); err != nil {
 		return nil, err
 	}
+	health, err := selectRecoveryPolicy(opts.RecoveryProfile, opts.Mode, opts.Reliable)
+	if err != nil {
+		return nil, err
+	}
 	path, err := cleanPath(opts.Path)
 	if err != nil {
 		return nil, err
@@ -77,6 +82,7 @@ func NewClient(_ context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opts 
 		serverAddr: serverAddr, rawDialer: dialer, cdnProtocol: opts.CDNProtocol,
 		tlsDialer: tls.NewDialer(dialer, config), config: config,
 		sessions: make(map[*clientConn]struct{}), reliable: opts.Reliable,
+		recoveryHealth:   health,
 		visionInnerTLS:   opts.VisionInnerTLS,
 		reliableSessions: make(map[*reliableSession]struct{}),
 		cdnMode:          opts.Mode == "cdn", cdnSessions: make(map[*cdnClientConn]struct{}),
@@ -103,6 +109,8 @@ func (c *Client) SetLogger(log logger.ContextLogger) {
 	} else {
 		log.Warn("sbxhttp: client initialized mode=legacy-v1 path=", c.target.Path,
 			" vision_inner_tls=", c.visionInnerTLS,
+			" recovery_h2_read_idle=", c.recoveryHealth.readIdle,
+			" recovery_h2_ping_timeout=", c.recoveryHealth.ping,
 			" (does NOT send X-SBXHTTP-Version; incompatible with Replay-v2-only server)")
 	}
 }
@@ -176,9 +184,9 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		},
 		// PING runs only when no H2 frames are received. It probes a dead TCP
 		// path, without applying an idle timeout to valid VLESS streams.
-		ReadIdleTimeout:  h2ReadIdleTimeout,
-		PingTimeout:      h2PingTimeout,
-		WriteByteTimeout: h2WriteByteTimeout,
+		ReadIdleTimeout:  c.recoveryHealth.readIdle,
+		PingTimeout:      c.recoveryHealth.ping,
+		WriteByteTimeout: c.recoveryHealth.writeByte,
 	}
 	go func() {
 		defer tr.CloseIdleConnections()

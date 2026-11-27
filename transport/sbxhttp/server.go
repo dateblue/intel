@@ -37,6 +37,7 @@ type Server struct {
 	mu               sync.Mutex
 	rawSockets       map[net.Conn]struct{}
 	reliable         bool
+	recoveryHealth   h2HealthPolicy
 	visionInnerTLS   bool
 	privateVisionTLS *stdtls.Config
 	reliableSessions map[string]*reliableSession
@@ -60,6 +61,10 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	if err := validatePrivateVisionMode(options.VisionInnerTLS, options.Reliable); err != nil {
 		return nil, err
 	}
+	health, err := selectRecoveryPolicy(options.RecoveryProfile, options.Mode, options.Reliable)
+	if err != nil {
+		return nil, err
+	}
 	path, err := cleanPath(options.Path)
 	if err != nil {
 		return nil, err
@@ -70,8 +75,13 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 	} else if options.Reliable {
 		log.Info("sbxhttp: server initialized mode=Replay-v2 path=", path, " required_version=", reliableVersion)
 	} else {
+		profile := recoveryProfileBalanced
+		if options.RecoveryProfile == recoveryProfileFast {
+			profile = recoveryProfileFast
+		}
 		log.Info("sbxhttp: server initialized mode=legacy-v1 path=", path,
-			" vision_inner_tls=", options.VisionInnerTLS)
+			" vision_inner_tls=", options.VisionInnerTLS,
+			" recovery_profile=", profile)
 	}
 	var visionConfig *stdtls.Config
 	if options.VisionInnerTLS {
@@ -80,7 +90,7 @@ func NewServer(ctx context.Context, log logger.ContextLogger, options option.V2R
 			return nil, err
 		}
 	}
-	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{}), cdnMode: options.Mode == "cdn", cdnSessions: make(map[string]*cdnServerSession)}, nil
+	return &Server{ctx: ctx, logger: log, handler: handler, tlsConfig: config, path: path, rawSockets: make(map[net.Conn]struct{}), slots: make(chan struct{}, maxSockets), reliable: options.Reliable, recoveryHealth: health, visionInnerTLS: options.VisionInnerTLS, privateVisionTLS: visionConfig, reliableSessions: make(map[string]*reliableSession), reliableStop: make(chan struct{}), cdnMode: options.Mode == "cdn", cdnSessions: make(map[string]*cdnServerSession)}, nil
 }
 func (s *Server) Network() []string                { return []string{N.NetworkTCP} }
 func (s *Server) ServePacket(net.PacketConn) error { return os.ErrInvalid }
@@ -159,6 +169,9 @@ func (s *Server) serveOne(raw net.Conn) {
 	h2 := newH2Server()
 	if s.cdnMode {
 		h2.MaxConcurrentStreams = 128 // CDN splits GET downstream and POST upstream
+	} else {
+		h2.ReadIdleTimeout = s.recoveryHealth.readIdle
+		h2.PingTimeout = s.recoveryHealth.ping
 	}
 	h2.ServeConn(conn, &http2.ServeConnOpts{
 		Context:    ctx,

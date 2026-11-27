@@ -97,6 +97,7 @@ type V2RaySBXHTTPOptions struct {
 	Mode            string   `json:"mode,omitempty"`             // "" = original Reality transport; "cdn" = standard TLS split H2 uplink/downlink
 	Path            string   `json:"path,omitempty"`
 	Reliable        bool     `json:"reliable,omitempty"`         // experimental v2 replay protocol; both ends must enable
+	RecoveryProfile string   `json:"recovery_profile,omitempty"` // optional: balanced (default), fast (direct H2 only); does not change wire format
 	VisionInnerTLS  bool     `json:"vision_inner_tls,omitempty"` // private SB-to-SB only; carries native Vision over H2
 }
 
