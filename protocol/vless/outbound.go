@@ -124,8 +124,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			Context:        ctx,
 			Logger:         logger,
 			ServerAddress:  options.Server,
-			Options:        common.PtrValueOrDefault(options.TLS),
 			DomainResolver: options.DomainResolver,
+			Options:        common.PtrValueOrDefault(options.TLS),
 			KTLSCompatible: common.PtrValueOrDefault(options.Transport).Type == "" &&
 				!common.PtrValueOrDefault(options.Multiplex).Enabled &&
 				options.Flow == "",

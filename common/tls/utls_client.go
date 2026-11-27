@@ -375,9 +375,6 @@ func init() {
 	randomizedFingerprint = utls.HelloRandomized
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
-	// Preserve the private PQC branch requirement: a hybrid-capable ClientHello
-	// must be generated for Reality servers that require X25519MLKEM768.
-	lxRandomFingerprints()
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {

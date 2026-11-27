@@ -8,11 +8,3 @@ const (
 	TLSEngineApple   = "apple"
 	TLSEngineWindows = "windows"
 )
-
-// Private Reality compatibility knob from the PQC branch. Default preserves
-// the ClientHello fingerprint; hybrid verifies the PQC share is present.
-const (
-	RealityKeyShareDefault   = ""
-	RealityKeyShareHybrid    = "hybrid"
-	RealityKeyShareClassical = "classical"
-)

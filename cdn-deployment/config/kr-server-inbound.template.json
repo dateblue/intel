@@ -6,7 +6,7 @@
   "users": [
     {
       "name": "kr-cdn",
-      "uuid": "1d5ae3d9-09e0-4e79-8fe7-cb81146454e7"
+      "uuid": "__VLESS_UUID__"
     }
   ],
   "decryption": "__VLESS_ENC_SERVER_PRIVATE_SPEC__",

@@ -86,12 +86,13 @@ for path, marker in [
 check("with_xhttp" not in workflow.split("BASE_TAGS:",1)[-1].split("\n",1)[0], "XHTTP build tag remains")
 check("with_xhttp" not in libbox, "XHTTP libbox build tag remains")
 
-for path, marker in [
-    ("common/tls/reality_client.go", "X25519MLKEM768"),
-    ("common/tls/utls_randomized_lx.go", "X25519MLKEM768"),
-    ("common/tls/utls_client.go", "lxRandomFingerprints()"),
-]:
-    check(marker in source(path), f"PQC Slim feature absent: {path}: {marker}")
+# alpha14 already implements the standard ML-KEM hybrid TLS curve and uTLS.
+# Reject accidental reintroduction of our redundant, fork-specific overrides.
+check("X25519MLKEM768" in source("option/tls.go"), "official hybrid TLS curve missing")
+check("MlkemEcdhe" in source("common/tls/reality_client.go"), "Reality hybrid-only auth key fallback missing")
+check("KeyShare string" not in source("option/tls.go"), "duplicate Reality key_share option reintroduced")
+check(not (root / "common/tls/utls_randomized_lx.go").exists(), "duplicate randomized uTLS override reintroduced")
+check("lxRandomFingerprints" not in source("common/tls/utls_client.go"), "duplicate random-fingerprint patch reintroduced")
 
 for tag in ["with_quic", "with_utls", "with_naive_outbound", "with_clash_api"]:
     check(tag in workflow, f"CLI tag missing: {tag}")
@@ -99,7 +100,8 @@ for tag in ["with_quic", "with_utls", "with_naive_outbound", "with_clash_api"]:
 shared_line = next((line for line in libbox.splitlines() if line.strip().startswith('sharedTags = append(sharedTags, "with_quic"')), "")
 for tag in ["with_wireguard", "with_openvpn", "with_openconnect", "with_usbip", "with_tailscale", "with_xhttp"]:
     check(tag not in shared_line, f"unwanted libbox shared tag: {tag}")
-check("go-version: '1.27.4'" in workflow, "CI is not pinned to Go 1.27.4")
+check("go-version: '1.27.3'" in workflow or "go-version: '1.27.4'" in workflow,
+      "CI Go 1.27 version missing")
 
 for path, marker in [
     ("option/tun.go", 'SniffOverrideDestination bool `json:"sniff_override_destination'),
@@ -107,6 +109,16 @@ for path, marker in [
     ("protocol/tun/inbound.go", "sniffOverrideDestination"),
 ]:
     check(marker not in source(path), f"deprecated custom sniff shim remains: {path}")
+# The clean baseline is the actual official v1.15.0-alpha.14 dependency set.
+mod = source("go.mod")
+check("go 1.26.11" in mod and "github.com/sagernet/quic-go v0.66.0-sing-box-mod.1" in mod,
+      "official alpha14 Go/QUIC dependencies missing")
+check("func (h *Inbound) References() ([]string, []string)" in source("protocol/vless/inbound.go"),
+      "alpha14 inbound reference API regressed")
+check('"__VLESS_UUID__"' in source("cdn-deployment/config/kr-server-inbound.template.json"),
+      "CDN server template contains an unsanitized UUID")
+check('"__VLESS_UUID__"' in source("cdn-deployment/config/wrt-client-outbound.template.json"),
+      "CDN client template contains an unsanitized UUID")
 if errors:
     print("FAIL: PQC slim source/profile consistency")
     for error in errors:

@@ -255,5 +255,4 @@ type OutboundRealityOptions struct {
 	Enabled   bool   `json:"enabled,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
 	ShortID   string `json:"short_id,omitempty"`
-	KeyShare  string `json:"key_share,omitempty"`
 }

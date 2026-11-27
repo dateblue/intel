@@ -17,10 +17,11 @@ if ($LASTEXITCODE -ne 0) { throw 'ENC key generator failed' }
 $pair = @($lines | Where-Object { $_ -match '^mlkem768x25519plus\.native\.1rtt\.' })
 if ($pair.Length -ne 2) { throw 'Expected exactly two ENC keys' }
 
+$uuid = [guid]::NewGuid().ToString()
 $s = Join-Path $Templates 'kr-server-inbound.template.json'
 $c = Join-Path $Templates 'wrt-client-outbound.template.json'
-$server = (Get-Content -Raw $s).Replace('__VLESS_ENC_SERVER_PRIVATE_SPEC__',$pair[0])
-$client = (Get-Content -Raw $c).Replace('__VLESS_ENC_CLIENT_PUBLIC_SPEC__',$pair[1])
+$server = (Get-Content -Raw $s).Replace('__VLESS_ENC_SERVER_PRIVATE_SPEC__',$pair[0]).Replace('__VLESS_UUID__',$uuid)
+$client = (Get-Content -Raw $c).Replace('__VLESS_ENC_CLIENT_PUBLIC_SPEC__',$pair[1]).Replace('__VLESS_UUID__',$uuid)
 $dest1 = Join-Path $Out 'kr-server-inbound.json'
 $dest2 = Join-Path $Out 'wrt-client-outbound.json'
 [System.IO.File]::WriteAllText($dest1,$server,(New-Object System.Text.UTF8Encoding $false))
