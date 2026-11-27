@@ -2,6 +2,7 @@ package sbxhttp
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -41,5 +42,27 @@ func newH2Server() *http2.Server {
 		MaxUploadBufferPerConnection: 4 << 20,
 		ReadIdleTimeout:              h2ReadIdleTimeout,
 		PingTimeout:                  h2PingTimeout,
+	}
+}
+
+// startHandshakeDeadline bounds the time spent waiting for initial HTTP
+// response headers. Calling stop after a successful response is essential:
+// the established HTTP/2 stream may remain open for hours and must not be
+// canceled merely because its connection-establishment timer has elapsed.
+func startHandshakeDeadline(cancel context.CancelFunc, timeout time.Duration) func() {
+	var access sync.Mutex
+	waiting := true
+	timer := time.AfterFunc(timeout, func() {
+		access.Lock()
+		defer access.Unlock()
+		if waiting {
+			cancel()
+		}
+	})
+	return func() {
+		access.Lock()
+		waiting = false
+		access.Unlock()
+		timer.Stop()
 	}
 }

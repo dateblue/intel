@@ -88,16 +88,16 @@ func (o V2RayTransportOptions) DescribeSchema(builder schema.Builder) (*schema.N
 	})
 }
 
-// SBXHTTP is a private sing-box-to-sing-box tunnel; not Xray-compatible.
-// All connection management settings are deliberately internal.
+// SBXHTTP is a private, non-Xray-compatible HTTP/2 VLESS transport.
+// No cross-session XMUX or MultiTCP aggregation is exposed.
 type V2RaySBXHTTPOptions struct {
-	CDNProtocol     string   `json:"cdn_protocol,omitempty"`     // CDN client only: h2 (default), h3, auto
-	DownConnections int      `json:"down_connections,omitempty"` // deprecated: non-zero rejected; remove this key from v0.7 configs
-	CDNIPs          []string `json:"cdn_ips,omitempty"`          // deprecated: non-empty rejected; use server to pin a single CDN edge IP
-	Mode            string   `json:"mode,omitempty"`             // "" = original Reality transport; "cdn" = standard TLS split H2 uplink/downlink
+	CDNProtocol     string   `json:"cdn_protocol,omitempty"`
+	DownConnections int      `json:"down_connections,omitempty"` // deprecated: non-zero rejected
+	CDNIPs          []string `json:"cdn_ips,omitempty"`          // deprecated: non-empty rejected
+	Mode            string   `json:"mode,omitempty"`             // "" Reality direct, "cdn" standard TLS split
 	Path            string   `json:"path,omitempty"`
-	Reliable        bool     `json:"reliable,omitempty"`         // experimental v2 replay protocol; both ends must enable
-	VisionInnerTLS  bool     `json:"vision_inner_tls,omitempty"` // private SB-to-SB only; carries native Vision over H2
+	Reliable        bool     `json:"reliable,omitempty"` // Replay-v2: both endpoints must opt-in
+	VisionInnerTLS  bool     `json:"vision_inner_tls,omitempty"`
 }
 
 type V2RayHTTPOptions struct {

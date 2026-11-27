@@ -27,7 +27,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/sagernet/sing-box/adapter"
+	tf "github.com/sagernet/sing-box/common/tlsfragment"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -35,7 +35,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 
 	utls "github.com/metacubex/utls"
@@ -46,7 +45,6 @@ import (
 var _ ConfigCompat = (*RealityClientConfig)(nil)
 
 type RealityClientConfig struct {
-	ctx       context.Context
 	uClient   *UTLSClientConfig
 	publicKey []byte
 	shortID   [8]byte
@@ -65,7 +63,7 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("spoof is unsupported in reality")
 	}
 
-	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName)
+	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +89,10 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 	default:
 		return nil, E.New("unknown reality key_share: ", options.Reality.KeyShare)
 	}
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID, options.Reality.KeyShare}
+	var config Config = &RealityClientConfig{
+		uClient: uClient.(*UTLSClientConfig), publicKey: publicKey,
+		shortID: shortID, keyShare: options.Reality.KeyShare,
+	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -139,9 +140,116 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
 }
 
 func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
-	uConn, verifier, err := e.prepareClientHello(conn)
+	uConfig := e.uClient.config.Clone()
+	var nowTime time.Time
+	if uConfig.Time != nil {
+		nowTime = uConfig.Time()
+	} else {
+		nowTime = time.Now()
+	}
+	verifier := &realityVerifier{
+		serverName:  e.uClient.ServerName(),
+		rootCAs:     uConfig.RootCAs,
+		currentTime: nowTime,
+	}
+	uConfig.InsecureSkipVerify = true
+	uConfig.SessionTicketsDisabled = true
+	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+	// Match ordinary uTLS fragmentation handling for Reality connections too.
+	if e.uClient.fragment || e.uClient.recordFragment {
+		conn = tf.NewConn(conn, e.uClient.ctx, e.uClient.fragment,
+			e.uClient.recordFragment, e.uClient.fragmentFallbackDelay)
+	}
+	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+	verifier.UConn = uConn
+	err := uConn.BuildHandshakeState()
 	if err != nil {
 		return nil, err
+	}
+	// Preserve the optional private PQC key-share behavior while keeping the
+	// alpha14 verifier, clock, ECH, and failure handling improvements intact.
+	switch e.keyShare {
+	case C.RealityKeyShareClassical:
+		for _, extension := range uConn.Extensions {
+			if curves, ok := extension.(*utls.SupportedCurvesExtension); ok {
+				curves.Curves = common.Filter(curves.Curves, func(v utls.CurveID) bool {
+					return v != utls.X25519MLKEM768
+				})
+			}
+			if shares, ok := extension.(*utls.KeyShareExtension); ok {
+				shares.KeyShares = common.Filter(shares.KeyShares, func(v utls.KeyShare) bool {
+					return v.Group != utls.X25519MLKEM768
+				})
+			}
+		}
+		if err = uConn.BuildHandshakeState(); err != nil {
+			return nil, err
+		}
+	case C.RealityKeyShareHybrid:
+		if !realityHelloCarriesHybridShare(uConn) {
+			return nil, E.New("reality hybrid key share missing from fingerprint: ", e.uClient.id.Client)
+		}
+	}
+	// Reality constructs UConn directly, bypassing the uTLS ALPN wrapper.
+	// Keep the negotiated ALPN in sync with the requested H2-only transport.
+	if len(uConfig.NextProtos) > 0 {
+		for _, extension := range uConn.Extensions {
+			if alpn, ok := extension.(*utls.ALPNExtension); ok {
+				alpn.AlpnProtocols = uConfig.NextProtos
+				if err = uConn.BuildHandshakeState(); err != nil {
+					return nil, E.Cause(err, "rebuild Reality ClientHello after ALPN update")
+				}
+				break
+			}
+		}
+	}
+
+	hello := uConn.HandshakeState.Hello
+	hello.SessionId = make([]byte, 32)
+	copy(hello.Raw[39:], hello.SessionId)
+
+	hello.SessionId[0] = 1
+	hello.SessionId[1] = 8
+	hello.SessionId[2] = 2
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(nowTime.Unix()))
+	copy(hello.SessionId[8:], e.shortID[:])
+	if debug.Enabled {
+		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
+	}
+	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
+	if err != nil {
+		return nil, err
+	}
+	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
+	if keyShareKeys == nil {
+		return nil, E.New("nil KeyShareKeys")
+	}
+	ecdheKey := keyShareKeys.Ecdhe
+	if ecdheKey == nil {
+		// A hybrid-only key share uses the X25519 component carried here.
+		ecdheKey = keyShareKeys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
+		return nil, E.New("nil ecdheKey")
+	}
+	authKey, err := ecdheKey.ECDH(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	if authKey == nil {
+		return nil, E.New("nil auth_key")
+	}
+	verifier.authKey = authKey
+	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
+	if err != nil {
+		return nil, err
+	}
+	aesBlock, _ := aes.NewCipher(authKey)
+	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
+	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+	copy(hello.Raw[39:], hello.SessionId)
+	if debug.Enabled {
+		fmt.Printf("REALITY hello.sessionId: %v\n", hello.SessionId)
 	}
 
 	err = uConn.HandshakeContext(ctx)
@@ -154,146 +262,18 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	if !verifier.verified {
-		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+		realityClientFallback(ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 		return nil, E.New("reality verification failed")
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
 }
 
-func (e *RealityClientConfig) prepareClientHello(conn net.Conn) (*utls.UConn, *realityVerifier, error) {
-	verifier := &realityVerifier{
-		serverName: e.uClient.ServerName(),
-	}
-	uConfig := e.uClient.config.Clone()
-	uConfig.InsecureSkipVerify = true
-	uConfig.SessionTicketsDisabled = true
-	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	// lx: SPEC 088 — the same `fragment` / `record_fragment` wrappers the plain
-	// uTLS client gets; upstream builds the UConn on the bare conn, so those
-	// flags (and the SPEC 060 detour default) were written to the config and
-	// ignored here.
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
-	verifier.UConn = uConn
-	// lx: SPEC 083 — апстрим здесь вырезал X25519MLKEM768 из supported_groups
-	// и key_share (костыль под utls v1.7.2, где Ecdhe гибрида и чистого X25519
-	// не различались). XTLS/REALITY@8cdf7bf (Xray ≥ v26.9.8) отвергает
-	// ClientHello без гибридного шара — молча проксирует на dest, у нас это
-	// «reality verification failed». metacubex/utls ≥ 1.8 кладёт ключи
-	// раздельно (Ecdhe / MlkemEcdhe), фильтр больше не нужен: отпечаток
-	// шлёт то, что заложено в его спеке (Chrome — GREASE, MLKEM, X25519).
-	err := uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, nil, err
-	}
-	// lx: SPEC 089 — `reality.key_share` поверх отпечатка. `classical` — тот
-	// самый апстримный фильтр, но по выбору узла: гибридный ClientHello
-	// (~1.9 КБ, два TCP-сегмента) кое-где теряется в сети, а классический
-	// (~0.5 КБ) проходит — ценой совместимости с Xray ≥ v26.9.8. `hybrid` —
-	// проверка, что отпечаток шар несёт: без неё узел на `edge` умирает как
-	// «reality verification failed», неотличимо от чужого ключа.
-	switch e.keyShare {
-	case C.RealityKeyShareClassical:
-		for _, extension := range uConn.Extensions {
-			if curves, isCurves := extension.(*utls.SupportedCurvesExtension); isCurves {
-				curves.Curves = common.Filter(curves.Curves, func(curveID utls.CurveID) bool {
-					return curveID != utls.X25519MLKEM768
-				})
-			}
-			if keyShares, isKeyShares := extension.(*utls.KeyShareExtension); isKeyShares {
-				keyShares.KeyShares = common.Filter(keyShares.KeyShares, func(share utls.KeyShare) bool {
-					return share.Group != utls.X25519MLKEM768
-				})
-			}
-		}
-		// Second build re-marshals the hello from the filtered extensions
-		// (the preset is applied once; see utls buildHandshakeState).
-		err = uConn.BuildHandshakeState()
-		if err != nil {
-			return nil, nil, err
-		}
-	case C.RealityKeyShareHybrid:
-		if !realityHelloCarriesHybridShare(uConn) {
-			return nil, nil, E.New("reality key_share \"hybrid\": fingerprint ", e.uClient.id.Client, " ", e.uClient.id.Version, " carries no X25519MLKEM768 key share")
-		}
-	}
-
-	if len(uConfig.NextProtos) > 0 {
-		for _, extension := range uConn.Extensions {
-			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
-				// Rebuild the marshaled ClientHello after changing ALPN, before
-				// sealing the REALITY SessionID. Keep the behavior consistent
-				// with utlsALPNWrapper.HandshakeContext.
-				alpnExtension.AlpnProtocols = uConfig.NextProtos
-				if err = uConn.BuildHandshakeState(); err != nil {
-					return nil, nil, E.Cause(err, "rebuild reality ClientHello with ALPN")
-				}
-				break
-			}
-		}
-	}
-
-	hello := uConn.HandshakeState.Hello
-	hello.SessionId = make([]byte, 32)
-	copy(hello.Raw[39:], hello.SessionId)
-
-	var nowTime time.Time
-	if uConfig.Time != nil {
-		nowTime = uConfig.Time()
-	} else {
-		nowTime = time.Now()
-	}
-	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
-
-	// lx: SPEC 053 — Xray v26.7.11 (XTLS/Xray-core@af7eb68) включил
-	// minClientVer=26.3.27 по умолчанию. Апстримный `1, 8, 1` ниже порога:
-	// сервер не отдаёт ошибку, а молча проксирует на камуфляжный dest.
-	// Объявляем ровно минимум — сравнение там `>=`, выше не нужно.
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(nowTime.Unix()))
-	copy(hello.SessionId[8:], e.shortID[:])
-	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
-	if keyShareKeys == nil {
-		return nil, nil, E.New("nil KeyShareKeys")
-	}
-	// lx: SPEC 083 — AuthKey считается по тому же шару, что берёт сервер:
-	// чистый X25519, если он есть в ClientHello, иначе X25519-часть
-	// X25519MLKEM768 (порядок выбора XTLS/REALITY@8cdf7bf, как у Xray-клиента).
-	ecdheKey := keyShareKeys.Ecdhe
-	if ecdheKey == nil {
-		ecdheKey = keyShareKeys.MlkemEcdhe
-	}
-	if ecdheKey == nil {
-		return nil, nil, E.New("nil ecdheKey")
-	}
-	authKey, err := ecdheKey.ECDH(publicKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	if authKey == nil {
-		return nil, nil, E.New("nil auth_key")
-	}
-	verifier.authKey = authKey
-	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	aesBlock, _ := aes.NewCipher(authKey)
-	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
-	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
-	copy(hello.Raw[39:], hello.SessionId)
-	return uConn, verifier, nil
-}
-
+// realityHelloCarriesHybridShare verifies the actual generated ClientHello,
+// rather than merely checking the name of the selected uTLS fingerprint.
 func realityHelloCarriesHybridShare(uConn *utls.UConn) bool {
-	for _, extension := range uConn.Extensions {
-		if keyShares, isKeyShares := extension.(*utls.KeyShareExtension); isKeyShares {
+	for _, ext := range uConn.Extensions {
+		if keyShares, ok := ext.(*utls.KeyShareExtension); ok {
 			for _, share := range keyShares.KeyShares {
 				if share.Group == utls.X25519MLKEM768 {
 					return true
@@ -311,10 +291,6 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 			DialTLSContext: func(ctx context.Context, network, addr string, config *tls.Config) (net.Conn, error) {
 				return uConn, nil
 			},
-			TLSClientConfig: &tls.Config{
-				Time:    ntp.TimeFuncFromContext(ctx),
-				RootCAs: adapter.RootPoolFromContext(ctx),
-			},
 		},
 	}
 	serverAddress := M.ParseSocksaddrHostPort(serverName, 0)
@@ -322,7 +298,7 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 	if serverAddress.IsIPv6() {
 		host = "[" + host + "]"
 	}
-	request, err := http.NewRequest("GET", "https://"+host, nil)
+	request, err := http.NewRequestWithContext(ctx, "GET", "https://"+host, nil)
 	if err != nil {
 		return
 	}
@@ -338,19 +314,20 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 
 func (e *RealityClientConfig) Clone() Config {
 	return &RealityClientConfig{
-		e.ctx,
-		e.uClient.Clone().(*UTLSClientConfig),
-		e.publicKey,
-		e.shortID,
-		e.keyShare,
+		uClient:   e.uClient.Clone().(*UTLSClientConfig),
+		publicKey: e.publicKey,
+		shortID:   e.shortID,
+		keyShare:  e.keyShare,
 	}
 }
 
 type realityVerifier struct {
 	*utls.UConn
-	serverName string
-	authKey    []byte
-	verified   bool
+	serverName  string
+	rootCAs     *x509.CertPool
+	currentTime time.Time
+	authKey     []byte
+	verified    bool
 }
 
 func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
@@ -365,6 +342,8 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
 		}
 	}
 	opts := x509.VerifyOptions{
+		Roots:         c.rootCAs,
+		CurrentTime:   c.currentTime,
 		DNSName:       c.serverName,
 		Intermediates: x509.NewCertPool(),
 	}

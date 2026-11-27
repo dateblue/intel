@@ -99,7 +99,7 @@ for tag in ["with_quic", "with_utls", "with_naive_outbound", "with_clash_api"]:
 shared_line = next((line for line in libbox.splitlines() if line.strip().startswith('sharedTags = append(sharedTags, "with_quic"')), "")
 for tag in ["with_wireguard", "with_openvpn", "with_openconnect", "with_usbip", "with_tailscale", "with_xhttp"]:
     check(tag not in shared_line, f"unwanted libbox shared tag: {tag}")
-check("go-version: '1.27.3'" in workflow, "CI is not pinned to user's Go 1.27.3")
+check("go-version: '1.27.4'" in workflow, "CI is not pinned to Go 1.27.4")
 
 for path, marker in [
     ("option/tun.go", 'SniffOverrideDestination bool `json:"sniff_override_destination'),

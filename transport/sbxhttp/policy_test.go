@@ -40,3 +40,27 @@ func TestHTTP2ServerHealthPolicy(t *testing.T) {
 		t.Fatal("flow control windows regressed")
 	}
 }
+
+// The deadline only covers response headers, not a long-lived VLESS session.
+func TestHandshakeDeadlineStopsAfterHeaders(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := startHandshakeDeadline(cancel, 20*time.Millisecond)
+	stop() // successful header response
+	time.Sleep(40 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("successful handshake canceled live stream: %v", err)
+	}
+}
+
+func TestHandshakeDeadlineCancelsStuckHeaders(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := startHandshakeDeadline(cancel, 15*time.Millisecond)
+	defer stop()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stuck HTTP handshake did not time out")
+	}
+}

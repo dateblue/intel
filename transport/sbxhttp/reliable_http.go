@@ -176,10 +176,23 @@ func (c *Client) reliableAttempt(sess *reliableSession, id string, established f
 		sendErr := sess.sendFrames(attemptCtx, bodyWriter, func() error { return nil })
 		cancelReliableOnFailure(sendErr, cancel, false)
 	}()
-	// A deadline on initial session establishment must not limit the lifetime
-	// of a successfully established VLESS session.
-	resp, err := tr.RoundTrip(req)
+	// Upstream sing-box alpha14 bounds HTTP handshake waits. Replay-v2 also
+	// re-attaches after the first successful dial, so its *every* physical
+	// attempt needs a bounded header wait, not merely the first dialReliable.
+	// The timer is stopped as soon as headers arrive; it never imposes a
+	// lifetime on the established stream or its upload/download half-close.
+	headerWait, err := boundedHandshakeTimeout(attemptCtx)
 	if err != nil {
+		return err
+	}
+	stopHandshake := startHandshakeDeadline(cancel, headerWait)
+	resp, err := tr.RoundTrip(req)
+	stopHandshake()
+	if err != nil {
+		return err
+	}
+	if err = attemptCtx.Err(); err != nil {
+		_ = resp.Body.Close()
 		return err
 	}
 	defer resp.Body.Close()
