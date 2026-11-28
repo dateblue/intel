@@ -21,13 +21,13 @@ on:
       version:
         description: '写入二进制的版本号'
         required: false
-        default: '1.15.0-alpha14-sbxhttp-recovery-r1'
+        default: '1.15.0-alpha15-sbxhttp-recovery-r1'
         type: string
 
 env:
   CORE_REPO: https://github.com/dateblue/intel.git
   CORE_REF: ${{ inputs.core_ref || 'pqc-new' }}
-  VERSION: ${{ inputs.version || '1.15.0-alpha14-sbxhttp-recovery-r1' }}
+  VERSION: ${{ inputs.version || '1.15.0-alpha15-sbxhttp-recovery-r1' }}
   # QUIC=HY2/TUIC/HTTP3 DNS; uTLS=Reality/PQC; Naive outbound is a build-tag opt-in.
   # SB-XHTTP, TUN, Fake-IP, SOCKS, VLESS inbound/outbound and sniff override are not build-tag gated.
   BASE_TAGS: with_quic,with_utls,with_clash_api,with_naive_outbound,badlinkname,tfogo_checklinkname0
@@ -77,7 +77,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: sing-box/go.sum
 
@@ -305,7 +305,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: core/go.sum
 
